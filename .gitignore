@@ -4,6 +4,9 @@
 # ============================================================
 /certs/
 
+# Secrets — copy all.yml.example → all.yml and fill in values
+inventory/group_vars/all.yml
+
 # Ansible runtime artifacts
 *.retry
 .cache/
