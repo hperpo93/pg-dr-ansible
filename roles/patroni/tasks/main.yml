@@ -38,30 +38,58 @@
 # directly, wait for PITR recovery to complete and promote, then start Patroni which
 # picks up the already-running primary.
 
-- name: "[primary][PITR] Start PostgreSQL directly to complete PITR before Patroni"
+- name: "[primary][DR] Override log_directory — production path may not exist on DR nodes"
+  ansible.builtin.lineinfile:
+    path: "{{ pg_data_dir }}/postgresql.auto.conf"
+    line: "log_directory = '/var/log/postgresql'"
+    regexp: "^log_directory"
+    create: true
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+  when:
+    - inventory_hostname in groups['pg_primary']
+    - restore_mode is defined
+    - restore_mode in ['primary', 'full']
+
+- name: "[primary][DR] Start PostgreSQL directly to complete recovery before Patroni"
   ansible.builtin.command: >
     {{ pg_bin_dir }}/pg_ctl -D {{ pg_data_dir }}
-    -l /var/log/postgresql/postgresql-primary-pitr.log
+    -l /var/log/postgresql/postgresql-primary-recovery.log
     start
   become: true
   become_user: "{{ pg_user }}"
   when:
     - inventory_hostname in groups['pg_primary']
-    - pgbackrest_restore_type | default('default') != 'default'
+    - restore_mode is defined
+    - restore_mode in ['primary', 'full']
 
-- name: "[primary][PITR] Wait for PostgreSQL to finish PITR and promote"
+- name: "[primary][DR] Wait for PostgreSQL to complete recovery and promote"
   ansible.builtin.command: >
     psql -U {{ pg_superuser }} -tAc "SELECT pg_is_in_recovery();"
   become: true
   become_user: "{{ pg_user }}"
-  register: pitr_recovery
-  until: pitr_recovery.stdout | trim == 'f'
+  register: pg_recovery_status
+  until: pg_recovery_status.stdout | trim == 'f'
   retries: 60
   delay: 5
   changed_when: false
   when:
     - inventory_hostname in groups['pg_primary']
-    - pgbackrest_restore_type | default('default') != 'default'
+    - restore_mode is defined
+    - restore_mode in ['primary', 'full']
+
+# Remove patroni.dynamic.json so Patroni uses the fresh bootstrap config (correct
+# DR node IPs in pg_hba, correct archive settings) instead of the old production
+# DCS config that was stored in PGDATA by the source cluster.
+- name: "[primary][DR] Remove patroni.dynamic.json — force Patroni to use bootstrap config"
+  ansible.builtin.file:
+    path: "{{ pg_data_dir }}/patroni.dynamic.json"
+    state: absent
+  when:
+    - inventory_hostname in groups['pg_primary']
+    - restore_mode is defined
+    - restore_mode in ['primary', 'full']
 
 # --- Primary: start first and wait for Leader --------------------------------
 

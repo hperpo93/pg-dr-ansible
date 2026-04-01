@@ -8,7 +8,7 @@ Stack    : PostgreSQL 18 + Patroni + etcd
 OS       : Ubuntu 24.04
 Nodes    : dr-node-1, dr-node-2, dr-node-3
 Standalone: dr-standalone (DR restore target, no Patroni)
-Backup   : backup-server (pgBackRest, stanza: postgresql-cluster)
+Backup   : psql-backups (pgBackRest, stanza: main)
 ```
 
 ---
@@ -148,10 +148,10 @@ dr-node-2 ansible_host=<node-2-ip>
 dr-node-3 ansible_host=<node-3-ip>
 
 [backup_server]
-backup-server ansible_host=<backup-server-ip>
+psql-backups ansible_host=<backup-server-ip>
 
 [all:vars]
-ansible_user=ubuntu
+ansible_user=perpo
 ```
 
 ### group_vars/all.yml — key variables to set
@@ -166,7 +166,8 @@ ansible_user=ubuntu
 pg_version:              "18"
 pg_superuser_password:   "CHANGE_ME"
 pg_replication_password: "CHANGE_ME"
-pgbackrest_repo_host:    "backup-server"
+pgbackrest_repo_host:    "psql-backups"
+pgbackrest_stanza:       "main"
 patroni_scope:           "postgresql-cluster"
 
 # Restore options (used by all DR playbooks)
@@ -213,12 +214,15 @@ joins each replica (serial: 1) so Patroni clones from the primary.
 
 ## Step 4 — pgBackRest backups
 
-| make | ansible / ssh equivalent |
-|------|--------------------------|
-| `make backup-full` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=full"` |
-| `make backup-incr` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr"` |
-| `make backup-list` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster info"` |
-| `make stanza-upgrade` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster stanza-upgrade"` |
+The `STANZA` make variable defaults to `main` and must match `pgbackrest_stanza` in `all.yml`.
+Override with `make backup-full STANZA=other` if your stanza name differs.
+
+| make | ssh equivalent |
+|------|----------------|
+| `make backup-full` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=main backup --type=full"` |
+| `make backup-incr` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=main backup --type=incr"` |
+| `make backup-list` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=main info"` |
+| `make stanza-upgrade` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=main stanza-upgrade"` |
 
 > Run `stanza-upgrade` after a PostgreSQL major version change (e.g. PG14 → PG18)
 > before taking the first backup with the new version.
@@ -253,6 +257,7 @@ instances automatically before wiping and restoring.
 | `RESTORE_TYPE=time` | `-e "pgbackrest_restore_type=time"` | `default` |
 | `RESTORE_TARGET='...'` | `-e "pgbackrest_restore_target='...'"` | `""` |
 | `FORCE=true` | `-e "force=true"` | `false` |
+| `STANZA=<name>` | n/a (Makefile only, for backup/stanza-upgrade targets) | `main` |
 
 ---
 
@@ -267,7 +272,7 @@ or etcd. SSL is disabled on the restored node (certs are not distributed).
 | `make dr-standalone-reset` | reset standalone node, then restore |
 | `make dr-standalone FORCE=true` | stop postgres on running standalone, then restore |
 | `make dr-standalone BACKUP_SET=<label>` | `ansible-playbook ... -e "pgbackrest_restore_set=<label>"` |
-| `make dr-standalone RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:00:00+00'` | `ansible-playbook ... -e "pgbackrest_restore_type=time" -e "pgbackrest_restore_target='...'"`  |
+| `make dr-standalone RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:00:00+00'` | `ansible-playbook ... -e "pgbackrest_restore_type=time" -e "pgbackrest_restore_target='...'"` |
 
 #### Standalone PITR examples
 
@@ -352,6 +357,7 @@ ssh dr-node-1 "sudo -u postgres psql -tAc 'SELECT count(*) FROM dr_test;'"
 | 3/8 | Start etcd cluster |
 | 4/8 | Wipe stale Patroni namespace from etcd |
 | 5/8 | pgBackRest restore on primary, start Patroni, wait for Leader |
+| 5.5/8 | Sync DB credentials — update replicator + superuser passwords to match `all.yml` (the restored backup carries production passwords; this ensures replicas can authenticate before cloning) |
 | 6/8 | Join replicas (Patroni clones from primary, serial: 1) |
 | 7/8 | HAProxy + Keepalived (skipped — no lb_nodes in inventory) |
 | 8/8 | Validate cluster topology |
@@ -405,7 +411,7 @@ ssh dr-node-1 "sudo -u postgres psql -c \"
 ssh dr-node-1 "sudo -u postgres psql -tAc 'SELECT pg_switch_wal();'"
 
 # Verify WAL is archived before recording T_AFTER
-ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster check"
+ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=main check"
 
 # Capture T_AFTER — recovery to this point will show 100 rows
 T_AFTER=$(date -u '+%Y-%m-%d %H:%M:%S+00')
@@ -439,7 +445,7 @@ ssh dr-node-1 "sudo -u postgres psql -c '\dt pitr_demo'"
 
 # Force WAL switch so the DROP is archived (needed for replay to work correctly)
 ssh dr-node-1 "sudo -u postgres psql -tAc 'SELECT pg_switch_wal();'"
-ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster check"
+ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=main check"
 
 echo "Accident archived. Restore targets:"
 echo "  T_BEFORE = $T_BEFORE  →  table exists, 0 rows"
@@ -596,13 +602,13 @@ etcdctl endpoint health
 etcdctl member list
 
 # pgBackRest — list backups
-sudo -u postgres pgbackrest --stanza=postgresql-cluster info
+sudo -u postgres pgbackrest --stanza=main info
 
 # pgBackRest — verify WAL archiving
-sudo -u postgres pgbackrest --stanza=postgresql-cluster check
+sudo -u postgres pgbackrest --stanza=main check
 
 # pgBackRest — take an incremental backup
-sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr
+sudo -u postgres pgbackrest --stanza=main backup --type=incr
 ```
 
 ---
@@ -614,7 +620,7 @@ sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr
 | Patroni won't start | `journalctl -u patroni -f` |
 | etcd unhealthy | `etcdctl endpoint health` — all 3 members must show `healthy` |
 | Replica stuck cloning | `patronictl list` — check lag; `tail -f /var/log/postgresql/*.log` |
-| pgBackRest restore fails | `tail -100 /var/log/pgbackrest/postgresql-cluster-restore.log` |
+| pgBackRest restore fails | `tail -100 /var/log/pgbackrest/main-restore.log` |
 | Standalone still in recovery | Connect and run: `SELECT pg_wal_replay_resume();` |
 | etcd namespace mismatch after DR | The wipe play (4/8 in dr_full_cluster) handles this automatically |
 | postgres can't read etcd certs | Check directory traversal ACLs: `getfacl /etc/etcd /etc/etcd/ssl` — postgres needs `--x` on both dirs plus `r` on cert files |
@@ -626,9 +632,10 @@ sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr
 | `dr-full` preflight blocks: "Patroni is active" | Nodes still running from a previous run. Use `make dr-full-reset` (wipe first) or `make dr-full FORCE=true` (stop automatically) |
 | Replica `start failed` after repeated DR runs | Timeline mismatch from accumulated restore history. Run `make reset-nodes && make dr-full` to restore cleanly |
 | `pg_ctl` start fails: "Address already in use" | A previous postgres process is still running. Use `make dr-standalone FORCE=true` or `make dr-standalone-reset` |
-| Standalone PITR: `recovery ended before configured recovery target was reached` | The backup's native timeline has too few WAL segments to reach the target (common for the full backup after many DR runs). The playbook auto-detects the correct timeline from `backup_label` — re-running should resolve it. If not, check that the target timestamp is within the WAL archive window: `sudo -u postgres pgbackrest --stanza=postgresql-cluster info` |
+| Replica stuck on `password authentication failed for user "replicator"` during clone | The restored backup carries the production replicator password, which differs from `all.yml`. In `dr-full`, PLAY 5.5 syncs the password automatically before replicas join. If running `dr-join-replica` manually right after `dr-primary`, wait ~60 s for Patroni to update the role, or run `psql -U postgres -c "ALTER ROLE replicator PASSWORD '...'"` on the primary first. |
+| Standalone PITR: `recovery ended before configured recovery target was reached` | The backup's native timeline has too few WAL segments to reach the target (common for the full backup after many DR runs). The playbook auto-detects the correct timeline from `backup_label` — re-running should resolve it. If not, check that the target timestamp is within the WAL archive window: `sudo -u postgres pgbackrest --stanza=main info` |
 | Standalone PITR: `requested timeline X is not a child of this server's history` | `'latest'` was used and the latest timeline branched before the backup's checkpoint — this happens after multiple PITR runs create new timeline branches. The playbook reads the timeline directly from `backup_label` to avoid this; if it still fails, check `cat $PGDATA/backup_label` and compare with `pgbackrest info` |
-| Full cluster PITR: Patroni promotes too early, ignores `recovery_target_time` | Patroni bootstraps at the consistency point, not the PITR target. The playbook starts PostgreSQL with `pg_ctl` first and waits for `pg_is_in_recovery()` to return `f` before starting Patroni — if the wait times out (60 × 5 s), check `/var/log/postgresql/postgresql-primary-pitr.log` on the primary |
+| Full cluster PITR: Patroni promotes too early, ignores `recovery_target_time` | Patroni bootstraps at the consistency point, not the PITR target. The playbook starts PostgreSQL with `pg_ctl` first and waits for `pg_is_in_recovery()` to return `f` before starting Patroni — if the wait times out (60 × 5 s), check `/var/log/postgresql/postgresql-primary-recovery.log` on the primary |
 | PITR target produces wrong row count | The target time may be slightly before or after the actual transaction commit. Use `pgbackrest info` to confirm WAL coverage and adjust the target by a few seconds |
 
 ---

@@ -208,6 +208,20 @@
 # cluster. The restored production pg_hba.conf may require md5 auth with a password
 # that differs from what Patroni has configured. Prepend local + loopback trust so
 # Patroni can connect. Patroni will overwrite pg_hba.conf with its DCS config later.
+- name: "[primary/full] Add restore_command so PostgreSQL can fetch WAL to complete backup recovery"
+  ansible.builtin.lineinfile:
+    path: "{{ pg_data_dir }}/postgresql.auto.conf"
+    line: "restore_command = 'pgbackrest --stanza={{ pgbackrest_stanza }} archive-get %f %p'"
+    regexp: "^restore_command"
+    create: true
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+  when:
+    - restore_mode is defined
+    - restore_mode in ['primary', 'full']
+    - pgbackrest_restore_type | default('default') == 'default'
+
 - name: "[primary/full] Prepend local trust to pg_hba.conf for Patroni bootstrap"
   ansible.builtin.blockinfile:
     path: "{{ pg_data_dir }}/pg_hba.conf"

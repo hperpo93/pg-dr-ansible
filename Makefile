@@ -14,6 +14,8 @@ RESTORE_TYPE ?= default
 RESTORE_TARGET ?=
 # FORCE=true — stop Patroni automatically on running nodes before restore
 FORCE ?=
+# pgBackRest stanza name (must match pgbackrest_stanza in group_vars/all.yml)
+STANZA ?= main
 
 # Build extra-vars string from restore options
 _RESTORE_VARS :=
@@ -123,22 +125,22 @@ cluster-reset: reset-nodes cluster
 .PHONY: backup-full
 backup-full:
 	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' ') \
-	  "sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=full --log-level-console=info"
+	  "sudo -u postgres pgbackrest --stanza=$(STANZA) backup --type=full --log-level-console=info"
 
 .PHONY: backup-incr
 backup-incr:
 	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' ') \
-	  "sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr --log-level-console=info"
+	  "sudo -u postgres pgbackrest --stanza=$(STANZA) backup --type=incr --log-level-console=info"
 
 .PHONY: backup-list
 backup-list:
 	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' ') \
-	  "sudo -u postgres pgbackrest --stanza=postgresql-cluster info"
+	  "sudo -u postgres pgbackrest --stanza=$(STANZA) info"
 
 .PHONY: stanza-upgrade
 stanza-upgrade:
 	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' ') \
-	  "sudo -u postgres pgbackrest --stanza=postgresql-cluster stanza-upgrade --log-level-console=info"
+	  "sudo -u postgres pgbackrest --stanza=$(STANZA) stanza-upgrade --log-level-console=info"
 
 # ── DR restore ────────────────────────────────────────────────────────────────
 

@@ -38,6 +38,7 @@
       - "postgresql-{{ pg_version }}"
       - "postgresql-client-{{ pg_version }}"
       - "postgresql-contrib-{{ pg_version }}"
+      - "postgresql-{{ pg_version }}-pgaudit"
     state: present
     update_cache: true
 

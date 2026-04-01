@@ -140,6 +140,33 @@
     - patroni
 
 # ---------------------------------------------------------------------------
+# PLAY 5.5 — Sync credentials: restored DB has production passwords; update
+# replicator (and superuser) to match all.yml before replicas try to clone.
+# Runs via local socket (trust), so works regardless of the restored password.
+# ---------------------------------------------------------------------------
+- name: "[5.5/8] Sync DB credentials to match Patroni config"
+  hosts: pg_primary
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Update replicator password to match pg_replication_password
+      ansible.builtin.command: >
+        psql -U {{ pg_superuser }}
+        -c "ALTER ROLE {{ pg_replication_user }} PASSWORD '{{ pg_replication_password }}';"
+      become: true
+      become_user: "{{ pg_user }}"
+      changed_when: true
+
+    - name: Update superuser password to match pg_superuser_password
+      ansible.builtin.command: >
+        psql -U {{ pg_superuser }}
+        -c "ALTER ROLE {{ pg_superuser }} PASSWORD '{{ pg_superuser_password }}';"
+      become: true
+      become_user: "{{ pg_user }}"
+      changed_when: true
+
+# ---------------------------------------------------------------------------
 # PLAY 6 — Join replicas one at a time
 # ---------------------------------------------------------------------------
 - name: "[6/8] Join replicas to Patroni cluster"
