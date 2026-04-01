@@ -13,6 +13,29 @@ Backup   : backup-server (pgBackRest, stanza: postgresql-cluster)
 
 ---
 
+## Quick start
+
+```bash
+make setup        # copy all.yml.example → all.yml, then fill in CHANGE_ME values
+make ping         # verify SSH connectivity to all nodes
+make cluster      # bootstrap full Patroni cluster
+make backup-full  # take first full backup
+make status       # show cluster topology
+```
+
+For DR testing:
+
+```bash
+make reset-nodes                                                  # wipe all pg nodes
+make dr-full                                                      # restore from latest backup
+make dr-standalone BACKUP_SET=20260331-114616F_20260331-120257I   # specific incremental
+make dr-full RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:00:00+00'  # PITR
+```
+
+Run `make` or `make help` to see all available targets.
+
+---
+
 ## DBA duties coverage
 
 | Requirement | Playbook / role | Status |
@@ -34,11 +57,13 @@ Backup   : backup-server (pgBackRest, stanza: postgresql-cluster)
 
 ```
 pg-dr-ansible/
+├── Makefile                              # One-liner targets for all operations
 ├── ansible.cfg
 ├── inventory/
 │   ├── hosts.ini                         # Node IPs, roles, etcd metadata
 │   └── group_vars/
-│       └── all.yml                       # All variables — set passwords here
+│       └── all.yml                       # All variables — set passwords here (gitignored)
+│       └── all.yml.example               # Template — copy to all.yml and fill in values
 ├── roles/
 │   ├── preflight/                        # OS check, disk space, backup SSH, Patroni guard
 │   ├── certs/                            # Generate CA + per-node TLS certs, distribute
@@ -80,9 +105,11 @@ ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N ""
 for host in <node-1-ip> <node-2-ip> <node-3-ip> <standalone-ip>; do
   ssh-copy-id <ssh-user>@${host}
 done
-
-ansible all -m ping
 ```
+
+| make | ansible equivalent |
+|------|--------------------|
+| `make ping` | `ansible all -m ping` |
 
 ---
 
@@ -118,10 +145,16 @@ ansible_user=ubuntu
 
 ### group_vars/all.yml — key variables to set
 
+`all.yml` is gitignored. Create it from the example then fill in the `CHANGE_ME` values:
+
+| make | ansible equivalent |
+|------|--------------------|
+| `make setup` | `cp inventory/group_vars/all.yml.example inventory/group_vars/all.yml` |
+
 ```yaml
 pg_version:              "18"
-pg_superuser_password:   "your-postgres-password"
-pg_replication_password: "your-replication-password"
+pg_superuser_password:   "CHANGE_ME"
+pg_replication_password: "CHANGE_ME"
 pgbackrest_repo_host:    "backup-server"
 patroni_scope:           "postgresql-cluster"
 
@@ -147,18 +180,15 @@ patch_slack_webhook: ""          # optional — leave empty to skip Slack
 
 ## Step 3 — Bootstrap the cluster (no pgBackRest restore)
 
-Use `patroni_start.yml` to bring up a fresh Patroni cluster. This installs
-packages, distributes certs, starts etcd, bootstraps the primary, then joins each
-replica (serial: 1) so Patroni clones from the primary.
+Installs packages, distributes certs, starts etcd, bootstraps the primary, then
+joins each replica (serial: 1) so Patroni clones from the primary.
 
-```bash
-# Full cluster (primary + all replicas)
-ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml
-
-# Primary only first, then add replicas
-ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml --limit pg_primary
-ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml --limit dr-node-2
-```
+| make | ansible equivalent |
+|------|--------------------|
+| `make cluster` | `ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml` |
+| `make cluster-primary` | `ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml --limit pg_primary` |
+| `make cluster AP_EXTRA="--limit dr-node-2"` | `ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml --limit dr-node-2` |
+| `make cluster-reset` | `make reset-nodes && make cluster` |
 
 | Play | Hosts | Action |
 |------|-------|--------|
@@ -168,77 +198,38 @@ ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml --limit dr-n
 | 4/5 | `pg_replicas` | Wipe PGDATA, start Patroni, wait for streaming (serial: 1) |
 | 5/5 | `pg_primary` | Validate cluster topology |
 
-### To rerun from scratch
-
-```bash
-for node in dr-node-1 dr-node-2 dr-node-3; do
-  ssh $node "sudo systemctl stop patroni; sudo systemctl stop etcd; \
-             sudo pkill -u postgres -9 2>/dev/null; \
-             sudo rm -rf /var/lib/postgresql/data/*; \
-             sudo rm -rf /var/lib/etcd/*"
-done
-
-ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml
-```
-
 ---
 
 ## Step 4 — pgBackRest backups
 
-With the cluster running, take backups from the primary.
+| make | ansible / ssh equivalent |
+|------|--------------------------|
+| `make backup-full` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=full"` |
+| `make backup-incr` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr"` |
+| `make backup-list` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster info"` |
+| `make stanza-upgrade` | `ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster stanza-upgrade"` |
 
-```bash
-# Full backup
-sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=full
-
-# Incremental backup
-sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr
-
-# List all backups
-sudo -u postgres pgbackrest --stanza=postgresql-cluster info
-```
-
-If you upgraded PostgreSQL major version (e.g. PG14 → PG18), upgrade the stanza
-metadata before taking the first backup with the new version:
-
-```bash
-sudo -u postgres pgbackrest --stanza=postgresql-cluster stanza-upgrade
-```
+> Run `stanza-upgrade` after a PostgreSQL major version change (e.g. PG14 → PG18)
+> before taking the first backup with the new version.
 
 ---
 
 ## Step 5 — DR restore
 
 All DR playbooks check that Patroni is **not running** before proceeding.
-Stop services and wipe data before each run:
 
-```bash
-for node in dr-node-1 dr-node-2 dr-node-3; do
-  ssh $node "sudo systemctl stop patroni; sudo systemctl stop etcd; \
-             sudo pkill -u postgres -9 2>/dev/null; \
-             sudo rm -rf /var/lib/postgresql/data/*; \
-             sudo rm -rf /var/lib/etcd/*"
-done
-```
+| make | what it does |
+|------|--------------|
+| `make reset-nodes` | Stop patroni + etcd, wipe PGDATA + etcd data on all pg nodes |
+| `make reset-standalone` | Stop PostgreSQL, wipe PGDATA on dr-standalone |
 
-### Choosing a backup
+### Restore variables
 
-By default all DR playbooks restore the **latest** backup. To target a specific
-backup (e.g. an incremental), set `pgbackrest_restore_set` in `group_vars/all.yml`
-or pass it as an extra var:
-
-```bash
-# Restore from a specific incremental
-ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml \
-  -e "pgbackrest_restore_set=20260331-114616F_20260331-120257I"
-
-# PITR to a point in time
-ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml \
-  -e "pgbackrest_restore_type=time" \
-  -e "pgbackrest_restore_target='2026-03-31 12:00:00+00'"
-```
-
-Leave `pgbackrest_restore_set: ""` (the default) to restore the latest backup.
+| make variable | ansible equivalent | default |
+|---------------|--------------------|---------|
+| `BACKUP_SET=<label>` | `-e "pgbackrest_restore_set=<label>"` | `""` (latest) |
+| `RESTORE_TYPE=time` | `-e "pgbackrest_restore_type=time"` | `default` |
+| `RESTORE_TARGET='...'` | `-e "pgbackrest_restore_target='...'"` | `""` |
 
 ---
 
@@ -247,28 +238,16 @@ Leave `pgbackrest_restore_set: ""` (the default) to restore the latest backup.
 Restores to the `[standalone]` host. PostgreSQL starts directly with no Patroni
 or etcd. SSL is disabled on the restored node (certs are not distributed).
 
-```bash
-# Latest backup
-ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml
+| make | ansible equivalent |
+|------|--------------------|
+| `make dr-standalone` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml` |
+| `make dr-standalone BACKUP_SET=<label>` | `ansible-playbook ... -e "pgbackrest_restore_set=<label>"` |
+| `make dr-standalone RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:00:00+00'` | `ansible-playbook ... -e "pgbackrest_restore_type=time" -e "pgbackrest_restore_target='2026-03-31 12:00:00+00'"` |
 
-# Specific incremental backup
-ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml \
-  -e "pgbackrest_restore_set=20260331-114616F_20260331-120257I"
-
-# PITR
-ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml \
-  -e "pgbackrest_restore_type=time" \
-  -e "pgbackrest_restore_target='2026-03-31 12:00:00+00'"
-```
-
-To rerun:
+To rerun, reset the standalone node first:
 
 ```bash
-ssh dr-standalone "sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl \
-  -D /var/lib/postgresql/data stop 2>/dev/null; \
-  sudo rm -rf /var/lib/postgresql/data/*"
-
-ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml
+make reset-standalone && make dr-standalone
 ```
 
 Connect directly (no VIP or load balancer):
@@ -279,35 +258,20 @@ psql -h <standalone-ip> -p 5432 -U postgres
 
 ### Mode 2 — Primary only, replicas join later
 
-```bash
-# Step A: restore and start primary
-ansible-playbook -i inventory/hosts.ini playbooks/dr_primary.yml
-
-# Step B: validate primary
-sudo -u postgres patronictl -c /etc/patroni/config.yml list
-
-# Step C: join all replicas
-ansible-playbook -i inventory/hosts.ini playbooks/dr_join_replica.yml
-
-# Step C (alt): join a single replica
-ansible-playbook -i inventory/hosts.ini playbooks/dr_join_replica.yml --limit dr-node-2
-```
+| make | ansible equivalent |
+|------|--------------------|
+| `make dr-primary` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_primary.yml` |
+| `make status` | `sudo -u postgres patronictl -c /etc/patroni/config.yml list` |
+| `make dr-join-replica` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_join_replica.yml` |
+| `make dr-join-replica AP_EXTRA="--limit dr-node-2"` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_join_replica.yml --limit dr-node-2` |
 
 ### Mode 3 — Full cluster in one run
 
-```bash
-# Latest backup
-ansible-playbook -i inventory/hosts.ini playbooks/dr_full_cluster.yml
-
-# Specific incremental backup
-ansible-playbook -i inventory/hosts.ini playbooks/dr_full_cluster.yml \
-  -e "pgbackrest_restore_set=20260331-114616F_20260331-120257I"
-
-# PITR
-ansible-playbook -i inventory/hosts.ini playbooks/dr_full_cluster.yml \
-  -e "pgbackrest_restore_type=time" \
-  -e "pgbackrest_restore_target='2026-03-31 12:00:00+00'"
-```
+| make | ansible equivalent |
+|------|--------------------|
+| `make dr-full` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_full_cluster.yml` |
+| `make dr-full BACKUP_SET=<label>` | `ansible-playbook ... -e "pgbackrest_restore_set=<label>"` |
+| `make dr-full RESTORE_TYPE=time RESTORE_TARGET='...'` | `ansible-playbook ... -e "pgbackrest_restore_type=time" -e "pgbackrest_restore_target='...'"` |
 
 | Play | Action |
 |------|--------|
@@ -326,9 +290,9 @@ ansible-playbook -i inventory/hosts.ini playbooks/dr_full_cluster.yml \
 
 ### Stage 1 — Open scheduling conversation
 
-```bash
-ansible-playbook playbooks/patch_notify.yml -e "notify_stage=schedule"
-```
+| make | ansible equivalent |
+|------|--------------------|
+| `make notify-schedule` | `ansible-playbook playbooks/patch_notify.yml -e "notify_stage=schedule"` |
 
 ### Stage 2 — Set the maintenance window in group_vars/all.yml
 
@@ -340,36 +304,24 @@ patch_window_end:   "2026-04-16 02:00"
 ### Stage 3 — Send reminders
 
 ```bash
+# make (pass window as AP_EXTRA since it varies per run)
+make AP_EXTRA="-e notify_stage=reminder_48h -e patch_window_start='2026-04-15 22:00' -e patch_window_end='2026-04-16 02:00'" notify-schedule
+
+# ansible equivalent
 ansible-playbook playbooks/patch_notify.yml \
   -e "notify_stage=reminder_48h" \
   -e "patch_window_start='2026-04-15 22:00'" \
   -e "patch_window_end='2026-04-16 02:00'"
-
-ansible-playbook playbooks/patch_notify.yml \
-  -e "notify_stage=reminder_24h" \
-  -e "patch_window_start='2026-04-15 22:00'" \
-  -e "patch_window_end='2026-04-16 02:00'"
-
-ansible-playbook playbooks/patch_notify.yml \
-  -e "notify_stage=reminder_day_of" \
-  -e "patch_window_start='2026-04-15 22:00'" \
-  -e "patch_window_end='2026-04-16 02:00'"
 ```
+
+Repeat with `reminder_24h` and `reminder_day_of`.
 
 ### Stage 4 — Execute rolling patch
 
-```bash
-# Dry run first
-ansible-playbook playbooks/patching.yml \
-  -e "patch_dry_run=true" \
-  -e "patch_window_start='2026-04-15 22:00'" \
-  -e "patch_window_end='2026-04-16 02:00'"
-
-# Live patch
-ansible-playbook playbooks/patching.yml \
-  -e "patch_window_start='2026-04-15 22:00'" \
-  -e "patch_window_end='2026-04-16 02:00'"
-```
+| make | ansible equivalent |
+|------|--------------------|
+| `make patch-dry AP_EXTRA="-e patch_window_start='2026-04-15 22:00' -e patch_window_end='2026-04-16 02:00'"` | `ansible-playbook playbooks/patching.yml -e "patch_dry_run=true" -e "patch_window_start=..."` |
+| `make patch AP_EXTRA="-e patch_window_start='2026-04-15 22:00' -e patch_window_end='2026-04-16 02:00'"` | `ansible-playbook playbooks/patching.yml -e "patch_window_start=..." -e "patch_window_end=..."` |
 
 The playbook patches replicas one at a time, then performs a `patronictl switchover`
 to move leadership off the primary and patches the old primary last.
@@ -378,20 +330,12 @@ to move leadership off the primary and patches the old primary last.
 
 ## Step 7 — Reindexing
 
-```bash
-# Report bloat only — no changes
-ansible-playbook playbooks/reindex.yml -e "reindex_dry_run=true"
-
-# Live reindex (default threshold: 20% dead tuple ratio)
-ansible-playbook playbooks/reindex.yml
-
-# Lower threshold
-ansible-playbook playbooks/reindex.yml -e "reindex_bloat_threshold_pct=15"
-
-# Target specific databases
-ansible-playbook playbooks/reindex.yml \
-  -e '{"reindex_target_databases": ["mydb", "reporting"]}'
-```
+| make | ansible equivalent |
+|------|--------------------|
+| `make reindex-dry` | `ansible-playbook playbooks/reindex.yml -e "reindex_dry_run=true"` |
+| `make reindex` | `ansible-playbook playbooks/reindex.yml` |
+| `make reindex AP_EXTRA="-e reindex_bloat_threshold_pct=15"` | `ansible-playbook playbooks/reindex.yml -e "reindex_bloat_threshold_pct=15"` |
+| `make reindex AP_EXTRA='-e {"reindex_target_databases":["mydb"]}'` | `ansible-playbook playbooks/reindex.yml -e '{"reindex_target_databases": ["mydb"]}'` |
 
 Every run appends a JSON line per index to `/var/log/postgresql/reindex_metrics.log`:
 
@@ -445,7 +389,7 @@ sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr
 | etcd namespace mismatch after DR | The wipe play (4/8 in dr_full_cluster) handles this automatically |
 | postgres can't read etcd certs | Check directory traversal ACLs: `getfacl /etc/etcd /etc/etcd/ssl` — postgres needs `--x` on both dirs plus `r` on cert files |
 | Patroni heartbeat auth fails | Ensure `host all all 127.0.0.1/32 trust` is in `patroni_pg_hba_static` |
-| Archive mismatch after PG upgrade | Run `pgbackrest --stanza=postgresql-cluster stanza-upgrade` on the primary |
+| Archive mismatch after PG upgrade | Run `make stanza-upgrade` (or `pgbackrest stanza-upgrade`) on the primary |
 | Patch fails mid-run | `journalctl -u patroni -f` on affected node; cluster stays online |
 | Reindex lock timeout | Retry off-peak or increase `reindex_lock_timeout` in group_vars/all.yml |
 | Notification emails not sent | Check SMTP relay: `telnet localhost 25`; verify `patch_smtp_host` |
