@@ -24,6 +24,14 @@
   ignore_errors: true
   when: restore_mode is defined and restore_mode == 'standalone'
 
+- name: Stop any pg_ctl-managed PostgreSQL on PGDATA (standalone re-run — clears port 5432)
+  ansible.builtin.command: >
+    {{ pg_bin_dir }}/pg_ctl -D {{ pg_data_dir }} stop -m fast
+  become: true
+  become_user: "{{ pg_user }}"
+  ignore_errors: true
+  when: restore_mode is defined and restore_mode == 'standalone'
+
 - name: Record restore start timestamp
   ansible.builtin.set_fact:
     restore_start_epoch: "{{ ansible_date_time.epoch }}"
@@ -153,6 +161,37 @@
   when:
     - restore_mode is defined
     - restore_mode == 'standalone'
+    - pgbackrest_restore_type | default('default') == 'default'
+
+- name: "[standalone] PITR — read backup timeline from backup_label"
+  ansible.builtin.shell: |
+    printf '%d' 0x$(grep 'START WAL' {{ pg_data_dir }}/backup_label \
+      | grep -oP '(?<=\(file )[0-9A-Fa-f]{8}')
+  become: true
+  become_user: "{{ pg_user }}"
+  register: _backup_tl
+  changed_when: false
+  when:
+    - restore_mode is defined
+    - restore_mode == 'standalone'
+    - pgbackrest_restore_type | default('default') != 'default'
+
+- name: "[standalone] PITR — set recovery_target_action + recovery_target_timeline (target already set by pgBackRest)"
+  ansible.builtin.lineinfile:
+    path: "{{ pg_data_dir }}/postgresql.auto.conf"
+    line: "{{ item }}"
+    regexp: "^{{ item.split('=')[0] | trim }}"
+    create: true
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+  loop:
+    - "recovery_target_action = 'promote'"
+    - "recovery_target_timeline = '{{ _backup_tl.stdout | trim }}'"
+  when:
+    - restore_mode is defined
+    - restore_mode == 'standalone'
+    - pgbackrest_restore_type | default('default') != 'default'
 
 - name: "[standalone] Write recovery.signal"
   ansible.builtin.file:
@@ -181,6 +220,20 @@
   when:
     - restore_mode is defined
     - restore_mode in ['primary', 'full']
+
+- name: "[primary/full] PITR — set recovery_target_timeline = current (target already set by pgBackRest)"
+  ansible.builtin.lineinfile:
+    path: "{{ pg_data_dir }}/postgresql.auto.conf"
+    line: "recovery_target_timeline = 'current'"
+    regexp: "^recovery_target_timeline"
+    create: true
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+  when:
+    - restore_mode is defined
+    - restore_mode in ['primary', 'full']
+    - pgbackrest_restore_type | default('default') != 'default'
 
 - name: "[standalone] Remove primary_conninfo from postgresql.auto.conf"
   ansible.builtin.lineinfile:

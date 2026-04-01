@@ -31,6 +31,38 @@
     mode: "0700"
     recurse: true
 
+# --- Primary: PITR pre-start — let PostgreSQL recover to target before Patroni
+
+# When PITR is requested, Patroni's bootstrap would promote PostgreSQL immediately
+# at the consistency point, ignoring recovery_target_time. Instead, start PostgreSQL
+# directly, wait for PITR recovery to complete and promote, then start Patroni which
+# picks up the already-running primary.
+
+- name: "[primary][PITR] Start PostgreSQL directly to complete PITR before Patroni"
+  ansible.builtin.command: >
+    {{ pg_bin_dir }}/pg_ctl -D {{ pg_data_dir }}
+    -l /var/log/postgresql/postgresql-primary-pitr.log
+    start
+  become: true
+  become_user: "{{ pg_user }}"
+  when:
+    - inventory_hostname in groups['pg_primary']
+    - pgbackrest_restore_type | default('default') != 'default'
+
+- name: "[primary][PITR] Wait for PostgreSQL to finish PITR and promote"
+  ansible.builtin.command: >
+    psql -U {{ pg_superuser }} -tAc "SELECT pg_is_in_recovery();"
+  become: true
+  become_user: "{{ pg_user }}"
+  register: pitr_recovery
+  until: pitr_recovery.stdout | trim == 'f'
+  retries: 60
+  delay: 5
+  changed_when: false
+  when:
+    - inventory_hostname in groups['pg_primary']
+    - pgbackrest_restore_type | default('default') != 'default'
+
 # --- Primary: start first and wait for Leader --------------------------------
 
 - name: "[primary] Start Patroni — bootstraps cluster"

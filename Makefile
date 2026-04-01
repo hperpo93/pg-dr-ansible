@@ -2,12 +2,18 @@ INVENTORY  := inventory/hosts.ini
 ANSIBLE    := ansible-playbook -i $(INVENTORY)
 AP_EXTRA   ?=
 
+# Final result banners — printed after every ansible-playbook run
+_OK   = printf '\n============================================================\n RESULT : SUCCESS\n============================================================\n\n'
+_FAIL = printf '\n============================================================\n RESULT : FAILED — check errors above\n============================================================\n\n'
+
 # Backup set to restore (leave empty for latest)
 BACKUP_SET ?=
 # Restore type: default | time | name | lsn
 RESTORE_TYPE ?= default
 # Restore target (used with time/name/lsn)
 RESTORE_TARGET ?=
+# FORCE=true — stop Patroni automatically on running nodes before restore
+FORCE ?=
 
 # Build extra-vars string from restore options
 _RESTORE_VARS :=
@@ -19,6 +25,9 @@ ifneq ($(RESTORE_TYPE),default)
 endif
 ifneq ($(RESTORE_TARGET),)
   _RESTORE_VARS += -e "pgbackrest_restore_target='$(RESTORE_TARGET)'"
+endif
+ifneq ($(FORCE),)
+  _RESTORE_VARS += -e "force=true"
 endif
 
 .DEFAULT_GOAL := help
@@ -42,10 +51,15 @@ help:
 	@echo "    make stanza-upgrade    Upgrade stanza after a PG major version change"
 	@echo ""
 	@echo "  DR Restore"
-	@echo "    make dr-standalone     Restore to standalone node (no Patroni)"
-	@echo "    make dr-primary        Restore primary only"
-	@echo "    make dr-join-replica   Join replica(s) to a running primary"
-	@echo "    make dr-full           Restore full 3-node cluster"
+	@echo "    make dr-standalone          Restore to standalone (nodes must be stopped)"
+	@echo "    make dr-standalone-reset    Wipe standalone then restore"
+	@echo "    make dr-standalone FORCE=true  Stop postgres on standalone, then restore"
+	@echo "    make dr-primary             Restore primary only (nodes must be stopped)"
+	@echo "    make dr-primary-reset       Wipe pg nodes then restore primary only"
+	@echo "    make dr-join-replica        Join replica(s) to a running primary"
+	@echo "    make dr-full                Restore full 3-node cluster (nodes must be stopped)"
+	@echo "    make dr-full-reset          Wipe all pg nodes then restore full cluster"
+	@echo "    make dr-full FORCE=true     Stop Patroni on running nodes, then restore"
 	@echo ""
 	@echo "  Operations"
 	@echo "    make patch             Rolling cluster patch"
@@ -65,6 +79,7 @@ help:
 	@echo "    BACKUP_SET=<label>     Restore a specific backup e.g. 20260331-114616F_20260331-120257I"
 	@echo "    RESTORE_TYPE=time      Use PITR"
 	@echo "    RESTORE_TARGET='...'   PITR timestamp e.g. '2026-03-31 12:00:00+00'"
+	@echo "    FORCE=true             Stop Patroni/postgres automatically before restore"
 	@echo "    AP_EXTRA='...'         Pass extra flags to ansible-playbook"
 	@echo ""
 	@echo "  Examples:"
@@ -94,11 +109,11 @@ ping:
 
 .PHONY: cluster
 cluster:
-	$(ANSIBLE) playbooks/patroni_start.yml $(AP_EXTRA)
+	$(ANSIBLE) playbooks/patroni_start.yml $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
 
 .PHONY: cluster-primary
 cluster-primary:
-	$(ANSIBLE) playbooks/patroni_start.yml --limit pg_primary $(AP_EXTRA)
+	$(ANSIBLE) playbooks/patroni_start.yml --limit pg_primary $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
 
 .PHONY: cluster-reset
 cluster-reset: reset-nodes cluster
@@ -107,75 +122,84 @@ cluster-reset: reset-nodes cluster
 
 .PHONY: backup-full
 backup-full:
-	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts -q | head -1 | tr -d ' ') \
+	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' ') \
 	  "sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=full --log-level-console=info"
 
 .PHONY: backup-incr
 backup-incr:
-	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts -q | head -1 | tr -d ' ') \
+	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' ') \
 	  "sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr --log-level-console=info"
 
 .PHONY: backup-list
 backup-list:
-	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts -q | head -1 | tr -d ' ') \
+	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' ') \
 	  "sudo -u postgres pgbackrest --stanza=postgresql-cluster info"
 
 .PHONY: stanza-upgrade
 stanza-upgrade:
-	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts -q | head -1 | tr -d ' ') \
+	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' ') \
 	  "sudo -u postgres pgbackrest --stanza=postgresql-cluster stanza-upgrade --log-level-console=info"
 
 # ── DR restore ────────────────────────────────────────────────────────────────
 
 .PHONY: dr-standalone
 dr-standalone:
-	$(ANSIBLE) playbooks/dr_standalone.yml $(_RESTORE_VARS) $(AP_EXTRA)
+	$(ANSIBLE) playbooks/dr_standalone.yml $(_RESTORE_VARS) $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
+
+.PHONY: dr-standalone-reset
+dr-standalone-reset: reset-standalone dr-standalone
 
 .PHONY: dr-primary
 dr-primary:
-	$(ANSIBLE) playbooks/dr_primary.yml $(_RESTORE_VARS) $(AP_EXTRA)
+	$(ANSIBLE) playbooks/dr_primary.yml $(_RESTORE_VARS) $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
+
+.PHONY: dr-primary-reset
+dr-primary-reset: reset-nodes dr-primary
 
 .PHONY: dr-join-replica
 dr-join-replica:
-	$(ANSIBLE) playbooks/dr_join_replica.yml $(AP_EXTRA)
+	$(ANSIBLE) playbooks/dr_join_replica.yml $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
 
 .PHONY: dr-full
 dr-full:
-	$(ANSIBLE) playbooks/dr_full_cluster.yml $(_RESTORE_VARS) $(AP_EXTRA)
+	$(ANSIBLE) playbooks/dr_full_cluster.yml $(_RESTORE_VARS) $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
+
+.PHONY: dr-full-reset
+dr-full-reset: reset-nodes dr-full
 
 # ── Operations ────────────────────────────────────────────────────────────────
 
 .PHONY: patch
 patch:
-	$(ANSIBLE) playbooks/patching.yml $(AP_EXTRA)
+	$(ANSIBLE) playbooks/patching.yml $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
 
 .PHONY: patch-dry
 patch-dry:
-	$(ANSIBLE) playbooks/patching.yml -e "patch_dry_run=true" $(AP_EXTRA)
+	$(ANSIBLE) playbooks/patching.yml -e "patch_dry_run=true" $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
 
 .PHONY: notify-schedule
 notify-schedule:
-	$(ANSIBLE) playbooks/patch_notify.yml -e "notify_stage=schedule" $(AP_EXTRA)
+	$(ANSIBLE) playbooks/patch_notify.yml -e "notify_stage=schedule" $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
 
 .PHONY: reindex
 reindex:
-	$(ANSIBLE) playbooks/reindex.yml $(AP_EXTRA)
+	$(ANSIBLE) playbooks/reindex.yml $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
 
 .PHONY: reindex-dry
 reindex-dry:
-	$(ANSIBLE) playbooks/reindex.yml -e "reindex_dry_run=true" $(AP_EXTRA)
+	$(ANSIBLE) playbooks/reindex.yml -e "reindex_dry_run=true" $(AP_EXTRA) && $(_OK) || { $(_FAIL); exit 1; }
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
 .PHONY: status
 status:
-	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts -q | head -1 | tr -d ' ') \
+	ssh $$(ansible -i $(INVENTORY) pg_primary --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' ') \
 	  "sudo -u postgres patronictl -c /etc/patroni/config.yml list"
 
 .PHONY: reset-nodes
 reset-nodes:
 	@echo "Stopping services and wiping PGDATA + etcd on all pg nodes..."
-	@for node in $$(ansible -i $(INVENTORY) pg_nodes --list-hosts -q | tr -d ' '); do \
+	@for node in $$(ansible -i $(INVENTORY) pg_nodes --list-hosts 2>/dev/null | grep -v '^\s*hosts' | tr -d ' '); do \
 	  echo "  wiping $$node"; \
 	  ssh $$node "sudo systemctl stop patroni; sudo systemctl stop etcd; \
 	              sudo pkill -u postgres -9 2>/dev/null; \
@@ -187,7 +211,7 @@ reset-nodes:
 .PHONY: reset-standalone
 reset-standalone:
 	@echo "Stopping PostgreSQL and wiping PGDATA on dr-standalone..."
-	@STANDALONE=$$(ansible -i $(INVENTORY) standalone --list-hosts -q | head -1 | tr -d ' '); \
+	@STANDALONE=$$(ansible -i $(INVENTORY) standalone --list-hosts 2>/dev/null | grep -v '^\s*hosts' | head -1 | tr -d ' '); \
 	ssh $$STANDALONE \
 	  "sudo -u postgres /usr/lib/postgresql/$$(sudo -u postgres psql -tAc 'SHOW server_version_num' 2>/dev/null | cut -c1-2)*/bin/pg_ctl \
 	   -D /var/lib/postgresql/data stop 2>/dev/null; \

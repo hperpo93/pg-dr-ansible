@@ -61,10 +61,12 @@
     msg: >
       Patroni is active on {{ inventory_hostname }}.
       Stop it before running a DR restore: systemctl stop patroni
+      (or re-run with FORCE=true to stop Patroni automatically)
   when:
     - inventory_hostname in groups['pg_nodes']
     - restore_mode is defined and restore_mode != ''
     - patroni_active.stdout | trim == 'active'
+    - not (force | default(false) | bool)
 
 - name: Preflight passed
   ansible.builtin.debug:

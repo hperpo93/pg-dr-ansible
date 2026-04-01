@@ -44,6 +44,35 @@
         restore_mode: primary
 
 # ---------------------------------------------------------------------------
+# PLAY 1.5 — Stop Patroni + PostgreSQL on all nodes (FORCE=true only)
+# ---------------------------------------------------------------------------
+- name: "[1.5/5] Stop Patroni + PostgreSQL on all nodes (FORCE=true)"
+  hosts: pg_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Stop Patroni on all nodes
+      ansible.builtin.systemd:
+        name: patroni
+        state: stopped
+      ignore_errors: true
+      when: force | default(false) | bool
+
+    - name: Stop PostgreSQL on all nodes
+      ansible.builtin.systemd:
+        name: postgresql
+        state: stopped
+      ignore_errors: true
+      when: force | default(false) | bool
+
+    - name: Kill any remaining postgres processes
+      ansible.builtin.command: pkill -u postgres -9
+      ignore_errors: true
+      changed_when: false
+      when: force | default(false) | bool
+
+# ---------------------------------------------------------------------------
 # PLAY 2 — Install packages + certs
 # ---------------------------------------------------------------------------
 - name: "[2/4] Install + certs"

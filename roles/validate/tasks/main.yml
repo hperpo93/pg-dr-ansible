@@ -5,13 +5,20 @@
 # Verifies Patroni cluster topology, replication, and pgBackRest WAL archiving.
 # =============================================================================
 
-- name: Query Patroni cluster status via API
+- name: Wait for Patroni Leader to be elected
   ansible.builtin.uri:
     url: "https://{{ ansible_default_ipv4.address }}:{{ patroni_api_port }}/cluster"
     method: GET
     validate_certs: false
     return_content: true
   register: cluster_status
+  until: >
+    cluster_status.status == 200 and
+    (cluster_status.json.members
+     | selectattr('role', 'equalto', 'leader')
+     | list | length == 1)
+  retries: 20
+  delay: 5
   when: inventory_hostname in groups['pg_primary']
 
 - name: Show cluster topology
@@ -23,7 +30,7 @@
   ansible.builtin.assert:
     that: >
       cluster_status.json.members
-      | selectattr('role', 'equalto', 'Leader')
+      | selectattr('role', 'equalto', 'leader')
       | list | length == 1
     fail_msg: "No Patroni Leader found. Check: journalctl -u patroni -f"
     success_msg: "Leader confirmed."
@@ -33,7 +40,7 @@
   ansible.builtin.assert:
     that: >
       cluster_status.json.members
-      | selectattr('role', 'equalto', 'Replica')
+      | selectattr('role', 'equalto', 'replica')
       | list | length >= (groups['pg_replicas'] | length)
     fail_msg: >
       Expected {{ groups['pg_replicas'] | length }} replica(s),

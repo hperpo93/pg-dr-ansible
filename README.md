@@ -26,10 +26,21 @@ make status       # show cluster topology
 For DR testing:
 
 ```bash
-make reset-nodes                                                  # wipe all pg nodes
-make dr-full                                                      # restore from latest backup
-make dr-standalone BACKUP_SET=20260331-114616F_20260331-120257I   # specific incremental
-make dr-full RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:00:00+00'  # PITR
+# From-scratch restore (wipes nodes first)
+make dr-full-reset
+
+# Refresh a running DR cluster from latest backup (stops Patroni, restores, rejoins)
+make dr-full FORCE=true
+
+# Standalone PITR — restore to a specific point in time
+make dr-standalone RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 11:55:00+00'
+make dr-standalone RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:03:10+00'
+
+# Full cluster PITR
+make dr-full FORCE=true RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:03:10+00'
+
+# Specific backup label
+make dr-full-reset BACKUP_SET=20260331-114616F_20260331-120257I
 ```
 
 Run `make` or `make help` to see all available targets.
@@ -216,7 +227,18 @@ joins each replica (serial: 1) so Patroni clones from the primary.
 
 ## Step 5 — DR restore
 
-All DR playbooks check that Patroni is **not running** before proceeding.
+### Choose your restore scenario
+
+| Scenario | Command | When to use |
+|----------|---------|-------------|
+| **From scratch** — wipe nodes, then restore | `make dr-full-reset` | Real DR simulation. Nodes are wiped clean before restoring from backup. |
+| **Refresh a running cluster** — stop, restore, rejoin | `make dr-full FORCE=true` | DR copy is stale and needs refreshing without manually stopping services first. |
+| **Manual reset + restore** | `make reset-nodes && make dr-full` | Same as `dr-full-reset` but explicit. |
+
+The `FORCE=true` flag bypasses the preflight Patroni guard and stops all Patroni
+instances automatically before wiping and restoring.
+
+### Reset utilities
 
 | make | what it does |
 |------|--------------|
@@ -230,6 +252,7 @@ All DR playbooks check that Patroni is **not running** before proceeding.
 | `BACKUP_SET=<label>` | `-e "pgbackrest_restore_set=<label>"` | `""` (latest) |
 | `RESTORE_TYPE=time` | `-e "pgbackrest_restore_type=time"` | `default` |
 | `RESTORE_TARGET='...'` | `-e "pgbackrest_restore_target='...'"` | `""` |
+| `FORCE=true` | `-e "force=true"` | `false` |
 
 ---
 
@@ -241,14 +264,36 @@ or etcd. SSL is disabled on the restored node (certs are not distributed).
 | make | ansible equivalent |
 |------|--------------------|
 | `make dr-standalone` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml` |
+| `make dr-standalone-reset` | reset standalone node, then restore |
+| `make dr-standalone FORCE=true` | stop postgres on running standalone, then restore |
 | `make dr-standalone BACKUP_SET=<label>` | `ansible-playbook ... -e "pgbackrest_restore_set=<label>"` |
-| `make dr-standalone RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:00:00+00'` | `ansible-playbook ... -e "pgbackrest_restore_type=time" -e "pgbackrest_restore_target='2026-03-31 12:00:00+00'"` |
+| `make dr-standalone RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:00:00+00'` | `ansible-playbook ... -e "pgbackrest_restore_type=time" -e "pgbackrest_restore_target='...'"`  |
 
-To rerun, reset the standalone node first:
+#### Standalone PITR examples
 
 ```bash
-make reset-standalone && make dr-standalone
+# Restore to a point BEFORE a table was created (table will be absent)
+make dr-standalone RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 11:55:00+00'
+
+# Restore to a point AFTER 100 rows were inserted (table + rows will be present)
+make dr-standalone RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:03:10+00'
+
+# Verify result after restore
+ssh dr-standalone "sudo -u postgres psql -tAc 'SELECT count(*) FROM dr_test;'"
 ```
+
+pgBackRest selects the latest backup whose stop time ≤ the target:
+
+| Target time | Backup used | Backup timeline | Expected result |
+|-------------|-------------|-----------------|-----------------|
+| `11:55:00` | full (11:46:23) | TL2 | table absent |
+| `12:03:10` | incr (12:03:05) | TL6 | 100 rows |
+
+> **Timeline note:** `recovery_target_timeline` is set automatically from the
+> restored `backup_label` (e.g. `2` for the full backup, `6` for the incr).
+> This avoids both `'current'` (may stop too early if the backup timeline has
+> limited WAL) and `'latest'` (may point to a branched timeline that is not
+> a descendant of the backup's checkpoint after repeated PITR runs).
 
 Connect directly (no VIP or load balancer):
 
@@ -258,9 +303,13 @@ psql -h <standalone-ip> -p 5432 -U postgres
 
 ### Mode 2 — Primary only, replicas join later
 
+Use for staged DR where you want to validate the primary before adding replicas.
+
 | make | ansible equivalent |
 |------|--------------------|
 | `make dr-primary` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_primary.yml` |
+| `make dr-primary-reset` | wipe all pg nodes, then restore primary only |
+| `make dr-primary FORCE=true` | stop Patroni on all nodes, then restore primary |
 | `make status` | `sudo -u postgres patronictl -c /etc/patroni/config.yml list` |
 | `make dr-join-replica` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_join_replica.yml` |
 | `make dr-join-replica AP_EXTRA="--limit dr-node-2"` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_join_replica.yml --limit dr-node-2` |
@@ -270,12 +319,35 @@ psql -h <standalone-ip> -p 5432 -U postgres
 | make | ansible equivalent |
 |------|--------------------|
 | `make dr-full` | `ansible-playbook -i inventory/hosts.ini playbooks/dr_full_cluster.yml` |
+| `make dr-full-reset` | wipe all pg nodes, then restore full cluster |
+| `make dr-full FORCE=true` | stop Patroni on all nodes, then restore full cluster |
 | `make dr-full BACKUP_SET=<label>` | `ansible-playbook ... -e "pgbackrest_restore_set=<label>"` |
 | `make dr-full RESTORE_TYPE=time RESTORE_TARGET='...'` | `ansible-playbook ... -e "pgbackrest_restore_type=time" -e "pgbackrest_restore_target='...'"` |
 
+#### Full cluster PITR examples
+
+```bash
+# PITR to before an accidental insert (table absent on restored cluster)
+make dr-full FORCE=true RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 11:55:00+00'
+
+# PITR to after an insert — 100 rows present, cluster fully running with replicas
+make dr-full FORCE=true RESTORE_TYPE=time RESTORE_TARGET='2026-03-31 12:03:10+00'
+
+# Verify: patronictl shows Leader + 2 streaming replicas, 0 lag
+ssh dr-node-1 "sudo -u postgres patronictl -c /etc/patroni/config.yml list"
+ssh dr-node-1 "sudo -u postgres psql -tAc 'SELECT count(*) FROM dr_test;'"
+```
+
+> **How full-cluster PITR works:** pgBackRest restores the backup on the primary.
+> PostgreSQL is started directly with `pg_ctl` (not Patroni) so that
+> `recovery_target_time` is honoured — Patroni would promote at the consistency
+> point and ignore the target. Once `pg_is_in_recovery()` returns `f`, Patroni
+> is started and the replicas clone from the recovered primary as normal.
+
 | Play | Action |
 |------|--------|
-| 1/8 | Preflight checks on all pg nodes |
+| 1/8 | Preflight checks on all pg nodes (skips Patroni guard if `FORCE=true`) |
+| 1.5/8 | Stop Patroni + PostgreSQL on all nodes (`FORCE=true` only) |
 | 2/8 | Install packages + distribute certs |
 | 3/8 | Start etcd cluster |
 | 4/8 | Wipe stale Patroni namespace from etcd |
@@ -283,6 +355,164 @@ psql -h <standalone-ip> -p 5432 -U postgres
 | 6/8 | Join replicas (Patroni clones from primary, serial: 1) |
 | 7/8 | HAProxy + Keepalived (skipped — no lb_nodes in inventory) |
 | 8/8 | Validate cluster topology |
+
+---
+
+## Step 5b — PITR walkthrough (end-to-end test)
+
+This section walks through a complete PITR test: create a table, insert data,
+simulate an accident, then recover to two different points in time.
+
+Run all commands from the Ansible control node.
+
+---
+
+### 1 — Establish a baseline backup
+
+```bash
+# Take a fresh full backup before the test
+make backup-full
+
+# Confirm it appears in the backup list
+make backup-list
+```
+
+---
+
+### 2 — Set up test data on the primary
+
+```bash
+# Create the demo table (empty at this point)
+ssh dr-node-1 "sudo -u postgres psql -c \"
+  CREATE TABLE IF NOT EXISTS pitr_demo (
+    id      serial PRIMARY KEY,
+    label   text,
+    created timestamptz DEFAULT clock_timestamp()
+  );
+\""
+
+# Capture T_BEFORE — recovery to this point will show an EMPTY table
+T_BEFORE=$(date -u '+%Y-%m-%d %H:%M:%S+00')
+echo "T_BEFORE (empty table) : $T_BEFORE"
+
+# Insert 100 rows
+ssh dr-node-1 "sudo -u postgres psql -c \"
+  INSERT INTO pitr_demo (label)
+    SELECT 'row_' || i FROM generate_series(1,100) i;
+\""
+
+# Force a WAL segment switch so the insert is immediately archived
+ssh dr-node-1 "sudo -u postgres psql -tAc 'SELECT pg_switch_wal();'"
+
+# Verify WAL is archived before recording T_AFTER
+ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster check"
+
+# Capture T_AFTER — recovery to this point will show 100 rows
+T_AFTER=$(date -u '+%Y-%m-%d %H:%M:%S+00')
+echo "T_AFTER  (100 rows)    : $T_AFTER"
+```
+
+> `pg_switch_wal()` forces an immediate WAL segment switch.
+> `pgbackrest check` blocks until that segment is confirmed archived —
+> this guarantees the PITR target has all the data it needs.
+
+---
+
+### 3 — Take an incremental backup (optional but realistic)
+
+```bash
+# In production a cron job does this; run it manually for the test
+make backup-incr
+make backup-list
+```
+
+---
+
+### 4 — Simulate the accident
+
+```bash
+# Someone drops the table
+ssh dr-node-1 "sudo -u postgres psql -c 'DROP TABLE pitr_demo;'"
+
+# Confirm it is gone
+ssh dr-node-1 "sudo -u postgres psql -c '\dt pitr_demo'"
+
+# Force WAL switch so the DROP is archived (needed for replay to work correctly)
+ssh dr-node-1 "sudo -u postgres psql -tAc 'SELECT pg_switch_wal();'"
+ssh dr-node-1 "sudo -u postgres pgbackrest --stanza=postgresql-cluster check"
+
+echo "Accident archived. Restore targets:"
+echo "  T_BEFORE = $T_BEFORE  →  table exists, 0 rows"
+echo "  T_AFTER  = $T_AFTER   →  table exists, 100 rows"
+```
+
+---
+
+### 5 — Restore to T_BEFORE (table present, no rows)
+
+```bash
+# Standalone PITR — no Patroni, fastest restore
+make dr-standalone RESTORE_TYPE=time RESTORE_TARGET="$T_BEFORE"
+
+# Verify
+ssh dr-standalone "sudo -u postgres psql -tAc 'SELECT count(*) FROM pitr_demo;'"
+# Expected output: 0
+```
+
+---
+
+### 6 — Restore to T_AFTER (table present, 100 rows)
+
+```bash
+# Re-run standalone PITR to a later point
+make dr-standalone RESTORE_TYPE=time RESTORE_TARGET="$T_AFTER"
+
+# Verify
+ssh dr-standalone "sudo -u postgres psql -tAc 'SELECT count(*) FROM pitr_demo;'"
+# Expected output: 100
+
+# Spot-check a sample of rows
+ssh dr-standalone "sudo -u postgres psql -c \
+  'SELECT id, label, created FROM pitr_demo ORDER BY id LIMIT 5;'"
+```
+
+---
+
+### 7 — (Optional) Full cluster PITR to T_AFTER
+
+Recovers to the same point on a full 3-node Patroni cluster instead of
+the standalone node.
+
+```bash
+make dr-full FORCE=true RESTORE_TYPE=time RESTORE_TARGET="$T_AFTER"
+
+# Verify cluster topology
+ssh dr-node-1 "sudo -u postgres patronictl -c /etc/patroni/config.yml list"
+
+# Verify data
+ssh dr-node-1 "sudo -u postgres psql -tAc 'SELECT count(*) FROM pitr_demo;'"
+# Expected output: 100
+```
+
+---
+
+### Reference: what pgBackRest selects for each target
+
+pgBackRest picks the **latest backup whose stop time ≤ the PITR target**.
+
+| PITR target | Backup selected | Why |
+|-------------|-----------------|-----|
+| `T_BEFORE` | Full backup | The incr's stop time is > T_BEFORE, so it cannot be used |
+| `T_AFTER`  | Incremental backup | Incr stop time ≤ T_AFTER; selected as latest valid backup |
+
+After restore, `recovery_target_timeline` is set automatically by reading the
+backup's timeline from `backup_label`. This avoids two common failures:
+
+| Setting | Failure mode |
+|---------|-------------|
+| `'current'` | Stops too early when the backup's own timeline has only a few WAL segments |
+| `'latest'`  | Fails with "not a child" after PITR runs branch the timeline tree |
+| *(auto from `backup_label`)* | Always uses the backup's native timeline — no branching issues |
 
 ---
 
@@ -393,6 +623,13 @@ sudo -u postgres pgbackrest --stanza=postgresql-cluster backup --type=incr
 | Patch fails mid-run | `journalctl -u patroni -f` on affected node; cluster stays online |
 | Reindex lock timeout | Retry off-peak or increase `reindex_lock_timeout` in group_vars/all.yml |
 | Notification emails not sent | Check SMTP relay: `telnet localhost 25`; verify `patch_smtp_host` |
+| `dr-full` preflight blocks: "Patroni is active" | Nodes still running from a previous run. Use `make dr-full-reset` (wipe first) or `make dr-full FORCE=true` (stop automatically) |
+| Replica `start failed` after repeated DR runs | Timeline mismatch from accumulated restore history. Run `make reset-nodes && make dr-full` to restore cleanly |
+| `pg_ctl` start fails: "Address already in use" | A previous postgres process is still running. Use `make dr-standalone FORCE=true` or `make dr-standalone-reset` |
+| Standalone PITR: `recovery ended before configured recovery target was reached` | The backup's native timeline has too few WAL segments to reach the target (common for the full backup after many DR runs). The playbook auto-detects the correct timeline from `backup_label` — re-running should resolve it. If not, check that the target timestamp is within the WAL archive window: `sudo -u postgres pgbackrest --stanza=postgresql-cluster info` |
+| Standalone PITR: `requested timeline X is not a child of this server's history` | `'latest'` was used and the latest timeline branched before the backup's checkpoint — this happens after multiple PITR runs create new timeline branches. The playbook reads the timeline directly from `backup_label` to avoid this; if it still fails, check `cat $PGDATA/backup_label` and compare with `pgbackrest info` |
+| Full cluster PITR: Patroni promotes too early, ignores `recovery_target_time` | Patroni bootstraps at the consistency point, not the PITR target. The playbook starts PostgreSQL with `pg_ctl` first and waits for `pg_is_in_recovery()` to return `f` before starting Patroni — if the wait times out (60 × 5 s), check `/var/log/postgresql/postgresql-primary-pitr.log` on the primary |
+| PITR target produces wrong row count | The target time may be slightly before or after the actual transaction commit. Use `pgbackrest info` to confirm WAL coverage and adjust the target by a few seconds |
 
 ---
 
