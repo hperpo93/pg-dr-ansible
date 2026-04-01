@@ -1,0 +1,141 @@
+---
+# =============================================================================
+# Playbook: dr_full_cluster.yml — Full Patroni cluster DR restore
+#
+# Orchestrates a complete cluster restore in one run:
+#   1. Preflight all nodes
+#   2. Install packages + certs on all pg nodes
+#   3. Start etcd on all nodes
+#   4. Restore primary via pgBackRest + bootstrap Patroni
+#   5. Join all replicas (serial: 1)
+#   6. Deploy HAProxy + Keepalived on lb nodes
+#   7. Validate full cluster topology
+#
+# Run:
+#   ansible-playbook -i inventory/hosts.ini playbooks/dr_full_cluster.yml
+#
+# PITR:
+#   ansible-playbook -i inventory/hosts.ini playbooks/dr_full_cluster.yml \
+#     -e "pgbackrest_restore_type=time" \
+#     -e "pgbackrest_restore_target='2024-06-15 14:30:00+00'"
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# PLAY 1 — Preflight all pg nodes in parallel
+# ---------------------------------------------------------------------------
+- name: "[1/7] Preflight — all pg nodes"
+  hosts: pg_nodes
+  become: true
+  gather_facts: true
+  vars:
+    restore_mode: full
+
+  tasks:
+    - name: Banner
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           DR MODE  : FULL CLUSTER
+           Node     : {{ inventory_hostname }} ({{ ansible_default_ipv4.address }})
+           Cluster  : {{ patroni_scope }}
+           Stanza   : {{ pgbackrest_stanza }}
+           Restore  : {{ pgbackrest_restore_type }}{{ ' → ' + pgbackrest_restore_target if pgbackrest_restore_target != '' else ' (latest)' }}
+          ============================================================
+
+    - ansible.builtin.import_role:
+        name: preflight
+      vars:
+        restore_mode: full
+
+# ---------------------------------------------------------------------------
+# PLAY 2 — Install packages + distribute certs on all pg nodes in parallel
+# ---------------------------------------------------------------------------
+- name: "[2/7] Install + certs — all pg nodes"
+  hosts: pg_nodes
+  become: true
+  gather_facts: true
+
+  roles:
+    - install
+    - certs
+
+# ---------------------------------------------------------------------------
+# PLAY 3 — Start etcd cluster on all three nodes
+# ---------------------------------------------------------------------------
+- name: "[3/8] etcd — start cluster on all nodes"
+  hosts: pg_nodes
+  become: true
+  gather_facts: true
+
+  roles:
+    - etcd
+
+# ---------------------------------------------------------------------------
+# PLAY 4 — Wipe stale Patroni cluster state from etcd
+# ---------------------------------------------------------------------------
+- name: "[4/8] Wipe stale Patroni cluster data from etcd"
+  hosts: pg_primary
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Remove Patroni cluster namespace from etcd
+      ansible.builtin.command: >
+        etcdctl
+        --endpoints=https://{{ etcd_node_ip }}:{{ etcd_client_port }}
+        --cacert={{ etcd_ssl_dir }}/ca.crt
+        --cert={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.crt
+        --key={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.key
+        del /service/{{ patroni_scope }} --prefix
+      register: etcd_wipe
+      changed_when: etcd_wipe.stdout | trim | int > 0
+
+    - name: Show etcd wipe result
+      ansible.builtin.debug:
+        msg: "Deleted {{ etcd_wipe.stdout | trim }} Patroni key(s) from etcd namespace /service/{{ patroni_scope }}"
+
+# ---------------------------------------------------------------------------
+# PLAY 5 — Restore primary via pgBackRest + bootstrap Patroni
+# ---------------------------------------------------------------------------
+- name: "[5/8] Restore primary + start Patroni"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  roles:
+    - pgbackrest_restore
+    - patroni
+
+# ---------------------------------------------------------------------------
+# PLAY 6 — Join replicas one at a time
+# ---------------------------------------------------------------------------
+- name: "[6/8] Join replicas to Patroni cluster"
+  hosts: pg_replicas
+  become: true
+  gather_facts: true
+  serial: 1
+
+  roles:
+    - patroni
+
+# ---------------------------------------------------------------------------
+# PLAY 7 — Deploy HAProxy + Keepalived
+# ---------------------------------------------------------------------------
+- name: "[7/8] HAProxy + Keepalived — lb nodes"
+  hosts: lb_nodes
+  become: true
+  gather_facts: true
+
+  roles:
+    - haproxy_keepalived
+
+# ---------------------------------------------------------------------------
+# PLAY 8 — Validate full cluster
+# ---------------------------------------------------------------------------
+- name: "[8/8] Validate — full cluster topology"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  roles:
+    - validate

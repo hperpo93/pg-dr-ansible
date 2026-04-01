@@ -1,0 +1,70 @@
+scope: {{ patroni_scope }}
+namespace: {{ patroni_namespace }}
+name: {{ inventory_hostname }}
+
+etcd3:
+  host: {{ etcd_node_ip }}:{{ etcd_client_port }}
+  protocol: https
+  cacert: {{ etcd_ssl_dir }}/ca.crt
+  cert: {{ etcd_ssl_dir }}/{{ etcd_cert_name }}.crt
+  key: {{ etcd_ssl_dir }}/{{ etcd_cert_name }}.key
+
+restapi:
+  listen: 0.0.0.0:{{ patroni_api_port }}
+  connect_address: {{ ansible_facts['default_ipv4']['address'] }}:{{ patroni_api_port }}
+  certfile: {{ pg_ssl_dir }}/server.pem
+
+bootstrap:
+  dcs:
+    ttl: {{ patroni_dcs.ttl }}
+    loop_wait: {{ patroni_dcs.loop_wait }}
+    retry_timeout: {{ patroni_dcs.retry_timeout }}
+    maximum_lag_on_failover: {{ patroni_dcs.maximum_lag_on_failover }}
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        ssl: 'on'
+        ssl_cert_file: {{ pg_ssl_dir }}/server.crt
+        ssl_key_file: {{ pg_ssl_dir }}/server.key
+        archive_mode: 'on'
+        archive_command: 'pgbackrest --stanza={{ pgbackrest_stanza }} archive-push %p'
+        archive_timeout: 60
+        restore_command: 'pgbackrest --stanza={{ pgbackrest_stanza }} archive-get %f %p'
+        wal_level: replica
+        hot_standby: 'on'
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_log_hints: 'on'
+      pg_hba:
+{% for entry in patroni_pg_hba_static %}
+      - {{ entry }}
+{% endfor %}
+{% for host in groups['pg_nodes'] %}
+      - "hostssl replication {{ pg_replication_user }} {{ hostvars[host]['etcd_node_ip'] }}/32 md5"
+{% endfor %}
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+postgresql:
+  listen: 0.0.0.0:{{ pg_port }}
+  connect_address: {{ ansible_facts['default_ipv4']['address'] }}:{{ pg_port }}
+  data_dir: {{ pg_data_dir }}
+  bin_dir: {{ pg_bin_dir }}
+  authentication:
+    superuser:
+      username: {{ pg_superuser }}
+      password: {{ pg_superuser_password }}
+    replication:
+      username: {{ pg_replication_user }}
+      password: {{ pg_replication_password }}
+  parameters:
+    max_connections: {{ pg_parameters.max_connections }}
+    shared_buffers: {{ pg_parameters.shared_buffers }}
+    unix_socket_directories: /var/run/postgresql
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

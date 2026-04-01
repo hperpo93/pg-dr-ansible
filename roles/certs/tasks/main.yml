@@ -1,0 +1,270 @@
+---
+# =============================================================================
+# Role: certs
+# Generates all TLS certificates on the Ansible control node, then
+# distributes them to the appropriate nodes.
+#
+# Produces:
+#   etcd:       ca.key, ca.crt, etcd-psqlN.key, etcd-psqlN.crt  (per node)
+#   postgresql: server.key, server.crt, server.pem               (per node)
+# =============================================================================
+
+# --- Local staging dir -------------------------------------------------------
+
+- name: Create local cert staging directory
+  ansible.builtin.file:
+    path: "{{ cert_local_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  run_once: true
+
+# --- etcd CA (generated once, shared by all nodes) ---------------------------
+
+- name: Check if etcd CA already exists
+  ansible.builtin.stat:
+    path: "{{ cert_local_dir }}/ca.crt"
+  delegate_to: localhost
+  run_once: true
+  register: ca_exists
+
+- name: Generate etcd CA private key
+  ansible.builtin.command: >
+    openssl genrsa -out {{ cert_local_dir }}/ca.key 2048
+  delegate_to: localhost
+  run_once: true
+  when: not ca_exists.stat.exists
+
+- name: Generate etcd CA self-signed certificate
+  ansible.builtin.command: >
+    openssl req -x509 -new -nodes
+    -key {{ cert_local_dir }}/ca.key
+    -subj "{{ etcd_ca_subj }}"
+    -days {{ etcd_cert_days }}
+    -out {{ cert_local_dir }}/ca.crt
+  delegate_to: localhost
+  run_once: true
+  when: not ca_exists.stat.exists
+
+# --- Per-node etcd certs -----------------------------------------------------
+
+- name: Check if node etcd cert already exists
+  ansible.builtin.stat:
+    path: "{{ cert_local_dir }}/{{ etcd_cert_name }}.crt"
+  delegate_to: localhost
+  register: node_cert_exists
+
+- name: Generate etcd node private key
+  ansible.builtin.command: >
+    openssl genrsa -out {{ cert_local_dir }}/{{ etcd_cert_name }}.key 2048
+  delegate_to: localhost
+  when: not node_cert_exists.stat.exists
+
+- name: Write etcd SAN config for this node
+  ansible.builtin.copy:
+    dest: "{{ cert_local_dir }}/{{ etcd_cert_name }}.cnf"
+    content: |
+      [ req ]
+      distinguished_name = req_distinguished_name
+      req_extensions = v3_req
+      [ req_distinguished_name ]
+      [ v3_req ]
+      subjectAltName = @alt_names
+      [ alt_names ]
+      IP.1 = {{ etcd_node_ip }}
+      IP.2 = 127.0.0.1
+    mode: "0644"
+  delegate_to: localhost
+  when: not node_cert_exists.stat.exists
+
+- name: Generate etcd node CSR
+  ansible.builtin.command: >
+    openssl req -new
+    -key {{ cert_local_dir }}/{{ etcd_cert_name }}.key
+    -out {{ cert_local_dir }}/{{ etcd_cert_name }}.csr
+    -subj "/C=US/ST=TX/L=Austin/O=AGI/OU=INF/CN={{ inventory_hostname }}"
+    -config {{ cert_local_dir }}/{{ etcd_cert_name }}.cnf
+  delegate_to: localhost
+  when: not node_cert_exists.stat.exists
+
+- name: Sign etcd node cert with CA
+  ansible.builtin.command: >
+    openssl x509 -req
+    -in {{ cert_local_dir }}/{{ etcd_cert_name }}.csr
+    -CA {{ cert_local_dir }}/ca.crt
+    -CAkey {{ cert_local_dir }}/ca.key
+    -CAcreateserial
+    -out {{ cert_local_dir }}/{{ etcd_cert_name }}.crt
+    -days {{ etcd_cert_days }}
+    -sha256
+    -extensions v3_req
+    -extfile {{ cert_local_dir }}/{{ etcd_cert_name }}.cnf
+  delegate_to: localhost
+  when: not node_cert_exists.stat.exists
+
+- name: Verify SAN is present in etcd cert
+  ansible.builtin.command: >
+    openssl x509 -in {{ cert_local_dir }}/{{ etcd_cert_name }}.crt
+    -text -noout
+  delegate_to: localhost
+  register: cert_verify
+  changed_when: false
+
+- name: Assert SAN is in cert
+  ansible.builtin.assert:
+    that: "'Subject Alternative Name' in cert_verify.stdout"
+    fail_msg: "SAN missing from {{ etcd_cert_name }}.crt — cert generation failed."
+
+# --- Per-node PostgreSQL self-signed certs -----------------------------------
+
+- name: Check if PostgreSQL server cert already exists
+  ansible.builtin.stat:
+    path: "{{ cert_local_dir }}/{{ inventory_hostname }}-server.crt"
+  delegate_to: localhost
+  register: pg_cert_exists
+
+- name: Generate PostgreSQL server private key
+  ansible.builtin.command: >
+    openssl genrsa -out {{ cert_local_dir }}/{{ inventory_hostname }}-server.key 2048
+  delegate_to: localhost
+  when: not pg_cert_exists.stat.exists
+
+- name: Generate PostgreSQL server CSR
+  ansible.builtin.command: >
+    openssl req -new
+    -key {{ cert_local_dir }}/{{ inventory_hostname }}-server.key
+    -out {{ cert_local_dir }}/{{ inventory_hostname }}-server.req
+    -subj "/CN={{ inventory_hostname }}"
+  delegate_to: localhost
+  when: not pg_cert_exists.stat.exists
+
+- name: Self-sign PostgreSQL server cert
+  ansible.builtin.command: >
+    openssl req -x509
+    -key {{ cert_local_dir }}/{{ inventory_hostname }}-server.key
+    -in {{ cert_local_dir }}/{{ inventory_hostname }}-server.req
+    -out {{ cert_local_dir }}/{{ inventory_hostname }}-server.crt
+    -days {{ pg_cert_days }}
+  delegate_to: localhost
+  when: not pg_cert_exists.stat.exists
+
+- name: Concatenate PEM file (crt + key)
+  ansible.builtin.shell: >
+    cat {{ cert_local_dir }}/{{ inventory_hostname }}-server.crt
+    {{ cert_local_dir }}/{{ inventory_hostname }}-server.key
+    > {{ cert_local_dir }}/{{ inventory_hostname }}-server.pem
+  delegate_to: localhost
+  when: not pg_cert_exists.stat.exists
+
+# --- Distribute etcd certs to nodes ------------------------------------------
+
+- name: Ensure etcd system user exists (may not yet be created by etcd role)
+  ansible.builtin.user:
+    name: "{{ etcd_user }}"
+    system: true
+    shell: /bin/false
+    state: present
+
+- name: Ensure etcd SSL directory exists on node
+  ansible.builtin.file:
+    path: "{{ etcd_ssl_dir }}"
+    state: directory
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_group }}"
+    mode: "0750"
+
+- name: Copy etcd CA cert to node
+  ansible.builtin.copy:
+    src: "{{ cert_local_dir }}/ca.crt"
+    dest: "{{ etcd_ssl_dir }}/ca.crt"
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_group }}"
+    mode: "0644"
+
+- name: Copy etcd node cert to node
+  ansible.builtin.copy:
+    src: "{{ cert_local_dir }}/{{ etcd_cert_name }}.crt"
+    dest: "{{ etcd_ssl_dir }}/{{ etcd_cert_name }}.crt"
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_group }}"
+    mode: "0644"
+
+- name: Copy etcd node key to node
+  ansible.builtin.copy:
+    src: "{{ cert_local_dir }}/{{ etcd_cert_name }}.key"
+    dest: "{{ etcd_ssl_dir }}/{{ etcd_cert_name }}.key"
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_group }}"
+    mode: "0600"
+
+# --- Distribute PostgreSQL certs to nodes ------------------------------------
+
+- name: Ensure PostgreSQL SSL directory exists
+  ansible.builtin.file:
+    path: "{{ pg_ssl_dir }}"
+    state: directory
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0750"
+
+- name: Copy PostgreSQL server.crt
+  ansible.builtin.copy:
+    src: "{{ cert_local_dir }}/{{ inventory_hostname }}-server.crt"
+    dest: "{{ pg_ssl_dir }}/server.crt"
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0644"
+
+- name: Copy PostgreSQL server.key
+  ansible.builtin.copy:
+    src: "{{ cert_local_dir }}/{{ inventory_hostname }}-server.key"
+    dest: "{{ pg_ssl_dir }}/server.key"
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+
+- name: Copy PostgreSQL server.req
+  ansible.builtin.copy:
+    src: "{{ cert_local_dir }}/{{ inventory_hostname }}-server.req"
+    dest: "{{ pg_ssl_dir }}/server.req"
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+
+- name: Copy PostgreSQL server.pem
+  ansible.builtin.copy:
+    src: "{{ cert_local_dir }}/{{ inventory_hostname }}-server.pem"
+    dest: "{{ pg_ssl_dir }}/server.pem"
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+
+# --- Grant postgres user read access to etcd certs via ACL ------------------
+
+- name: Install acl package
+  ansible.builtin.apt:
+    name: acl
+    state: present
+
+- name: Grant postgres user traverse access to etcd parent directories
+  ansible.posix.acl:
+    path: "{{ item }}"
+    entity: "{{ pg_user }}"
+    etype: user
+    permissions: x
+    state: present
+  loop:
+    - /etc/etcd
+    - "{{ etcd_ssl_dir }}"
+
+- name: Grant postgres user read access to etcd certs (setfacl)
+  ansible.posix.acl:
+    path: "{{ etcd_ssl_dir }}/{{ item }}"
+    entity: "{{ pg_user }}"
+    etype: user
+    permissions: r
+    state: present
+  loop:
+    - ca.crt
+    - "{{ etcd_cert_name }}.crt"
+    - "{{ etcd_cert_name }}.key"

@@ -1,0 +1,75 @@
+---
+# =============================================================================
+# Playbook: patching.yml — Rolling PostgreSQL patch on Patroni cluster
+#
+# Execution order:
+#   1. Pre-patch validation — confirms cluster is healthy before starting
+#   2. Patch replicas one at a time (serial: 1)
+#   3. Switchover — moves leader to a healthy replica
+#   4. Patch old primary (now a replica)
+#   5. Post-patch validation — confirms all nodes healthy
+#   6. Notifications — begin and complete announcements via email + Slack
+#
+# Prerequisites:
+#   - Run patch_notify.yml through the full reminder cycle first
+#   - Confirm maintenance window is agreed with Armando and Ron
+#   - Confirm pgBackRest backup is current before patching
+#
+# Run (live):
+#   ansible-playbook -i inventory/hosts.ini playbooks/patching.yml \
+#     -e "patch_window_start='2024-06-20 22:00'" \
+#     -e "patch_window_end='2024-06-21 02:00'"
+#
+# Dry run (no changes, notifications still sent):
+#   ansible-playbook -i inventory/hosts.ini playbooks/patching.yml \
+#     -e "patch_dry_run=true" \
+#     -e "patch_window_start='2024-06-20 22:00'" \
+#     -e "patch_window_end='2024-06-21 02:00'"
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# PLAY 1 — Confirm cluster is healthy before touching anything
+# ---------------------------------------------------------------------------
+- name: "[1/3] Pre-patch validation"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Banner
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           PATRONI ROLLING PATCH
+           Cluster  : {{ patroni_scope }}
+           Nodes    : {{ groups['pg_nodes'] | join(', ') }}
+           Window   : {{ patch_window_start | default('not set') }} — {{ patch_window_end | default('not set') }}
+           Dry run  : {{ patch_dry_run | default(false) }}
+          ============================================================
+
+    - ansible.builtin.import_role:
+        name: validate
+
+# ---------------------------------------------------------------------------
+# PLAY 2 — Execute rolling patch across all nodes
+# Replicas are patched in serial, then primary is patched last
+# ---------------------------------------------------------------------------
+- name: "[2/3] Rolling patch — replicas first, then primary"
+  hosts: pg_nodes
+  become: true
+  gather_facts: true
+  serial: 1     # one node at a time — never patch two nodes simultaneously
+
+  roles:
+    - patching
+
+# ---------------------------------------------------------------------------
+# PLAY 3 — Post-patch validation
+# ---------------------------------------------------------------------------
+- name: "[3/3] Post-patch validation"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  roles:
+    - validate

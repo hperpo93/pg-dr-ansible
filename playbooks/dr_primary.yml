@@ -1,0 +1,107 @@
+---
+# =============================================================================
+# Playbook: dr_primary.yml — DR restore primary node only
+#
+# Restores the primary node via pgBackRest and bootstraps the Patroni cluster.
+# Replicas are NOT added here — join them later with dr_join_replica.yml.
+#
+# Use for: staged DR where you want to validate the primary before replicas.
+#
+# Run:
+#   ansible-playbook -i inventory/hosts.ini playbooks/dr_primary.yml
+#
+# PITR:
+#   ansible-playbook -i inventory/hosts.ini playbooks/dr_primary.yml \
+#     -e "pgbackrest_restore_type=time" \
+#     -e "pgbackrest_restore_target='2024-06-15 14:30:00+00'"
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# PLAY 1 — Preflight
+# ---------------------------------------------------------------------------
+- name: "[1/4] Preflight"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+  vars:
+    restore_mode: primary
+
+  tasks:
+    - name: Banner
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           DR MODE  : PRIMARY ONLY (Patroni, replicas join later)
+           Target   : {{ inventory_hostname }} ({{ ansible_facts['default_ipv4']['address'] | default('') }})
+           Cluster  : {{ patroni_scope | default('') }}
+           Stanza   : {{ pgbackrest_stanza | default('') }}
+           Restore  : {{ pgbackrest_restore_type | default('') }}{{ ' → ' + pgbackrest_restore_target if (pgbackrest_restore_target | default('')) != '' else ' (latest)' }}
+          ============================================================
+
+    - ansible.builtin.import_role:
+        name: preflight
+      vars:
+        restore_mode: primary
+
+# ---------------------------------------------------------------------------
+# PLAY 2 — Install packages + certs
+# ---------------------------------------------------------------------------
+- name: "[2/4] Install + certs"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  roles:
+    - install
+    - certs
+
+# ---------------------------------------------------------------------------
+# PLAY 3 — Start etcd on primary node (single-node etcd for DR primary)
+# ---------------------------------------------------------------------------
+- name: "[3/5] Start etcd on primary DR node"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  roles:
+    - etcd
+
+# ---------------------------------------------------------------------------
+# PLAY 4 — Wipe stale Patroni cluster state from etcd
+# Required when re-running DR after a previous bootstrap, since etcd retains
+# the old cluster's system ID and Patroni will refuse to start if it mismatches
+# the restored PGDATA's system ID.
+# ---------------------------------------------------------------------------
+- name: "[4/5] Wipe stale Patroni cluster data from etcd"
+  hosts: pg_primary
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Remove Patroni cluster namespace from etcd
+      ansible.builtin.command: >
+        etcdctl
+        --endpoints=https://{{ etcd_node_ip }}:{{ etcd_client_port }}
+        --cacert={{ etcd_ssl_dir }}/ca.crt
+        --cert={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.crt
+        --key={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.key
+        del /service/{{ patroni_scope }} --prefix
+      register: etcd_wipe
+      changed_when: etcd_wipe.stdout | trim | int > 0
+
+    - name: Show etcd wipe result
+      ansible.builtin.debug:
+        msg: "Deleted {{ etcd_wipe.stdout | trim }} Patroni key(s) from etcd namespace /service/{{ patroni_scope }}"
+
+# ---------------------------------------------------------------------------
+# PLAY 5 — Restore data + start Patroni primary
+# ---------------------------------------------------------------------------
+- name: "[5/5] Restore via pgBackRest + bootstrap Patroni primary"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  roles:
+    - pgbackrest_restore
+    - patroni
+    - validate

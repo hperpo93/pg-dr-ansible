@@ -1,0 +1,15 @@
+#!/bin/bash
+
+PORT={{ haproxy_rw_port }}
+
+if ! pidof haproxy > /dev/null; then
+    echo "haproxy is not running"
+    exit 1
+fi
+
+if ! ss -ltn | grep -q ":${PORT}"; then
+    echo "haproxy is not listening on port ${PORT}"
+    exit 2
+fi
+
+exit 0

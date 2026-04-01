@@ -1,0 +1,31 @@
+global_defs {
+    enable_script_security
+    script_user nobody
+    max_auto_priority 99
+}
+
+vrrp_script check_haproxy {
+    script "{{ keepalived_check_script }}"
+    interval 2
+    timeout 2
+}
+
+vrrp_instance haproxy.vip {
+    interface {{ keepalived_interface }}
+    state {{ keepalived_state }}
+    virtual_router_id {{ keepalived_router_id }}
+    advert_int {{ keepalived_advert_int }}
+    priority {{ keepalived_priority }}
+    unicast_src_ip {{ keepalived_src_ip }}
+    unicast_peer {
+{% for peer in keepalived_peers.split(',') %}
+      {{ peer | trim }}
+{% endfor %}
+    }
+    track_script {
+        check_haproxy
+    }
+    virtual_ipaddress {
+        {{ keepalived_vip }}
+    }
+}

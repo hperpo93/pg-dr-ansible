@@ -1,0 +1,121 @@
+---
+# =============================================================================
+# Role: validate
+# Post-build / post-restore health checks.
+# Verifies Patroni cluster topology, replication, and pgBackRest WAL archiving.
+# =============================================================================
+
+- name: Query Patroni cluster status via API
+  ansible.builtin.uri:
+    url: "https://{{ ansible_default_ipv4.address }}:{{ patroni_api_port }}/cluster"
+    method: GET
+    validate_certs: false
+    return_content: true
+  register: cluster_status
+  when: inventory_hostname in groups['pg_primary']
+
+- name: Show cluster topology
+  ansible.builtin.debug:
+    msg: "{{ cluster_status.json | to_nice_json }}"
+  when: inventory_hostname in groups['pg_primary']
+
+- name: Assert exactly one Leader exists
+  ansible.builtin.assert:
+    that: >
+      cluster_status.json.members
+      | selectattr('role', 'equalto', 'Leader')
+      | list | length == 1
+    fail_msg: "No Patroni Leader found. Check: journalctl -u patroni -f"
+    success_msg: "Leader confirmed."
+  when: inventory_hostname in groups['pg_primary']
+
+- name: Assert expected number of replicas are streaming
+  ansible.builtin.assert:
+    that: >
+      cluster_status.json.members
+      | selectattr('role', 'equalto', 'Replica')
+      | list | length >= (groups['pg_replicas'] | length)
+    fail_msg: >
+      Expected {{ groups['pg_replicas'] | length }} replica(s),
+      found fewer streaming.
+    success_msg: >
+      {{ groups['pg_replicas'] | length }} replica(s) confirmed streaming.
+  when: inventory_hostname in groups['pg_primary']
+  ignore_errors: true
+
+- name: Confirm primary is not in recovery
+  ansible.builtin.command: >
+    psql -U {{ pg_superuser }} -tAc "SELECT pg_is_in_recovery();"
+  become: true
+  become_user: "{{ pg_user }}"
+  register: in_recovery
+  changed_when: false
+  when: inventory_hostname in groups['pg_primary']
+
+- name: Assert primary is not in recovery
+  ansible.builtin.assert:
+    that: in_recovery.stdout | trim == 'f'
+    fail_msg: "Primary is still in recovery mode. Check Patroni logs."
+    success_msg: "Primary is promoted and accepting writes."
+  when: inventory_hostname in groups['pg_primary']
+
+- name: List databases on primary
+  ansible.builtin.command: >
+    psql -U {{ pg_superuser }} -c "\l"
+  become: true
+  become_user: "{{ pg_user }}"
+  register: db_list
+  changed_when: false
+  when: inventory_hostname in groups['pg_primary']
+
+- name: Show databases
+  ansible.builtin.debug:
+    msg: "{{ db_list.stdout_lines }}"
+  when: inventory_hostname in groups['pg_primary']
+
+- name: Verify WAL archiving is working (pgBackRest check)
+  ansible.builtin.command: >
+    pgbackrest --stanza={{ pgbackrest_stanza }} check
+  become: true
+  become_user: "{{ pg_user }}"
+  register: pgbackrest_check
+  changed_when: false
+  when: inventory_hostname in groups['pg_primary']
+  ignore_errors: true
+
+- name: Show pgBackRest check result
+  ansible.builtin.debug:
+    msg: "{{ pgbackrest_check.stdout_lines }}"
+  when: inventory_hostname in groups['pg_primary']
+
+- name: Verify HAProxy VIP is reachable
+  ansible.builtin.wait_for:
+    host: "{{ keepalived_vip }}"
+    port: "{{ haproxy_rw_port }}"
+    timeout: 10
+  run_once: true
+  delegate_to: localhost
+  ignore_errors: true
+  register: vip_check
+
+- name: Report VIP status
+  ansible.builtin.debug:
+    msg: >
+      VIP {{ keepalived_vip }}:{{ haproxy_rw_port }}
+      {{ 'is reachable' if vip_check is not failed else 'is NOT reachable — check keepalived' }}
+  run_once: true
+
+- name: Summary
+  ansible.builtin.debug:
+    msg: |
+      ============================================================
+       CLUSTER VALIDATION COMPLETE
+       Cluster    : {{ patroni_scope }}
+       Primary    : {{ groups['pg_primary'][0] }}
+       Replicas   : {{ groups['pg_replicas'] | join(', ') }}
+       VIP        : {{ keepalived_vip }}:{{ haproxy_rw_port }} (RW)
+                    {{ keepalived_vip }}:{{ haproxy_ro_port }} (RO)
+       Connect    : psql -h {{ keepalived_vip }} -U postgres
+      ============================================================
+  run_once: true
+  when: inventory_hostname in groups['pg_primary']

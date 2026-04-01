@@ -1,0 +1,197 @@
+---
+# =============================================================================
+# Playbook: patch_notify.yml — Patch scheduling notifications
+#
+# Sends notification emails to Armando and Ron per the DBA patching procedure:
+#   - Initial scheduling conversation opener
+#   - 48-hour reminder
+#   - 24-hour reminder
+#   - Day-of reminder
+#
+# Run each stage independently using the `notify_stage` variable:
+#
+#   # Open scheduling conversation (run first, before window is set)
+#   ansible-playbook playbooks/patch_notify.yml \
+#     -e "notify_stage=schedule"
+#
+#   # 48-hour reminder (set patch_window_start/end in group_vars or here)
+#   ansible-playbook playbooks/patch_notify.yml \
+#     -e "notify_stage=reminder_48h" \
+#     -e "patch_window_start='2024-06-20 22:00'" \
+#     -e "patch_window_end='2024-06-21 02:00'"
+#
+#   # 24-hour reminder
+#   ansible-playbook playbooks/patch_notify.yml \
+#     -e "notify_stage=reminder_24h" \
+#     -e "patch_window_start='2024-06-20 22:00'" \
+#     -e "patch_window_end='2024-06-21 02:00'"
+#
+#   # Day-of reminder
+#   ansible-playbook playbooks/patch_notify.yml \
+#     -e "notify_stage=reminder_day_of" \
+#     -e "patch_window_start='2024-06-20 22:00'" \
+#     -e "patch_window_end='2024-06-21 02:00'"
+# =============================================================================
+
+- name: Patch notifications — {{ notify_stage | default('schedule') }}
+  hosts: localhost
+  gather_facts: true
+  vars:
+    notify_stage: "schedule"    # override with -e notify_stage=<stage>
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Stage: schedule — open the scheduling conversation
+    # -------------------------------------------------------------------------
+
+    - name: "[schedule] Send scheduling conversation opener"
+      ansible.builtin.mail:
+        host: "{{ patch_smtp_host }}"
+        port: "{{ patch_smtp_port }}"
+        from: "{{ patch_notify_from }}"
+        to: "{{ item.email }}"
+        subject: "[PostgreSQL] Scheduling conversation — {{ patroni_scope }} maintenance"
+        body: |
+          Hi {{ item.name }},
+
+          I'm reaching out to initiate a scheduling conversation for the
+          upcoming PostgreSQL cluster maintenance.
+
+          Cluster : {{ patroni_scope }}
+          Nodes   : {{ groups['pg_nodes'] | join(', ') }}
+
+          Please let me know your availability and any blackout periods
+          so we can agree on a maintenance window that works for everyone.
+
+          Once a window is confirmed, I will send reminders at:
+            - 48 hours before
+            - 24 hours before
+            - Day of
+
+          Please reply with your preferred window or any constraints.
+
+          -- DBA Team
+      loop: "{{ patch_notify_contacts }}"
+      when: notify_stage == 'schedule'
+
+    - name: "[schedule] Send scheduling Slack message"
+      ansible.builtin.uri:
+        url: "{{ patch_slack_webhook }}"
+        method: POST
+        body_format: json
+        body:
+          text: >
+            :calendar: *PostgreSQL maintenance scheduling* —
+            cluster `{{ patroni_scope }}` — Armando and Ron have been contacted
+            to agree on a maintenance window.
+      when:
+        - notify_stage == 'schedule'
+        - patch_slack_webhook != ""
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # Stage: reminder_48h
+    # -------------------------------------------------------------------------
+
+    - name: "[48h] Send 48-hour reminder"
+      ansible.builtin.mail:
+        host: "{{ patch_smtp_host }}"
+        port: "{{ patch_smtp_port }}"
+        from: "{{ patch_notify_from }}"
+        to: "{{ item.email }}"
+        subject: "[PostgreSQL] REMINDER — 48 hours — {{ patroni_scope }} maintenance"
+        body: "{{ lookup('template', '../roles/patching/templates/reminder_email.j2') }}"
+      vars:
+        reminder_label: "48-hour"
+      loop: "{{ patch_notify_contacts }}"
+      when: notify_stage == 'reminder_48h'
+
+    - name: "[48h] Send 48-hour Slack reminder"
+      ansible.builtin.uri:
+        url: "{{ patch_slack_webhook }}"
+        method: POST
+        body_format: json
+        body:
+          text: >
+            :alarm_clock: *48-hour reminder* — PostgreSQL maintenance on
+            cluster `{{ patroni_scope }}` scheduled for
+            {{ patch_window_start }} — {{ patch_window_end }}
+      when:
+        - notify_stage == 'reminder_48h'
+        - patch_slack_webhook != ""
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # Stage: reminder_24h
+    # -------------------------------------------------------------------------
+
+    - name: "[24h] Send 24-hour reminder"
+      ansible.builtin.mail:
+        host: "{{ patch_smtp_host }}"
+        port: "{{ patch_smtp_port }}"
+        from: "{{ patch_notify_from }}"
+        to: "{{ item.email }}"
+        subject: "[PostgreSQL] REMINDER — 24 hours — {{ patroni_scope }} maintenance"
+        body: "{{ lookup('template', '../roles/patching/templates/reminder_email.j2') }}"
+      vars:
+        reminder_label: "24-hour"
+      loop: "{{ patch_notify_contacts }}"
+      when: notify_stage == 'reminder_24h'
+
+    - name: "[24h] Send 24-hour Slack reminder"
+      ansible.builtin.uri:
+        url: "{{ patch_slack_webhook }}"
+        method: POST
+        body_format: json
+        body:
+          text: >
+            :alarm_clock: *24-hour reminder* — PostgreSQL maintenance on
+            cluster `{{ patroni_scope }}` is tomorrow:
+            {{ patch_window_start }} — {{ patch_window_end }}
+      when:
+        - notify_stage == 'reminder_24h'
+        - patch_slack_webhook != ""
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # Stage: reminder_day_of
+    # -------------------------------------------------------------------------
+
+    - name: "[day-of] Send day-of reminder"
+      ansible.builtin.mail:
+        host: "{{ patch_smtp_host }}"
+        port: "{{ patch_smtp_port }}"
+        from: "{{ patch_notify_from }}"
+        to: "{{ item.email }}"
+        subject: "[PostgreSQL] TODAY — {{ patroni_scope }} maintenance begins at {{ patch_window_start }}"
+        body: "{{ lookup('template', '../roles/patching/templates/reminder_email.j2') }}"
+      vars:
+        reminder_label: "day-of"
+      loop: "{{ patch_notify_contacts }}"
+      when: notify_stage == 'reminder_day_of'
+
+    - name: "[day-of] Send day-of Slack reminder"
+      ansible.builtin.uri:
+        url: "{{ patch_slack_webhook }}"
+        method: POST
+        body_format: json
+        body:
+          text: >
+            :mega: *Day-of reminder* — PostgreSQL maintenance on
+            cluster `{{ patroni_scope }}` begins TODAY at {{ patch_window_start }}.
+            Window closes at {{ patch_window_end }}.
+      when:
+        - notify_stage == 'reminder_day_of'
+        - patch_slack_webhook != ""
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # Confirmation
+    # -------------------------------------------------------------------------
+
+    - name: Notification sent
+      ansible.builtin.debug:
+        msg: >
+          Notification stage '{{ notify_stage }}' sent to:
+          {{ patch_notify_contacts | map(attribute='email') | join(', ') }}

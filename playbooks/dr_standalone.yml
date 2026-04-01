@@ -1,0 +1,125 @@
+---
+# =============================================================================
+# Playbook: dr_standalone.yml — DR restore to plain PostgreSQL (no Patroni)
+#
+# Target : [standalone] group in inventory/hosts.ini
+#          Set ansible_host to your designated restore / test server.
+#          This node is completely isolated from the Patroni cluster —
+#          no etcd, no Patroni, no HAProxy. Plain PostgreSQL only.
+#
+# Use for: smoke testing, dev validation, single-server recovery.
+#
+# Run:
+#   ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml
+#
+# PITR:
+#   ansible-playbook -i inventory/hosts.ini playbooks/dr_standalone.yml \
+#     -e "pgbackrest_restore_type=time" \
+#     -e "pgbackrest_restore_target='2024-06-15 14:30:00+00'"
+# =============================================================================
+
+- name: DR Restore — standalone PostgreSQL (no Patroni)
+  hosts: standalone
+  become: true
+  gather_facts: true
+  vars:
+    restore_mode: standalone
+
+  pre_tasks:
+    - name: Banner
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           DR MODE  : STANDALONE — plain PostgreSQL, no Patroni
+           Target   : {{ inventory_hostname }} ({{ ansible_facts['default_ipv4']['address'] | default('') }})
+           Stanza   : {{ pgbackrest_stanza | default('') }}
+           Restore  : {{ pgbackrest_restore_type | default('') }}{{ ' → ' + pgbackrest_restore_target if (pgbackrest_restore_target | default('')) != '' else ' (latest)' }}
+          ============================================================
+
+    - name: Confirm OS is Ubuntu 24.04+
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version is version('24.04', '>=')
+        fail_msg: "This playbook targets Ubuntu 24.04+. Found: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Check free disk space
+      ansible.builtin.shell: |
+        df --output=avail -BG "{{ pg_data_dir | dirname }}" 2>/dev/null || \
+        df --output=avail -BG / | tail -1
+      register: free_disk
+      changed_when: false
+
+    - name: Parse free disk GB
+      ansible.builtin.set_fact:
+        free_disk_gb: "{{ free_disk.stdout | regex_replace('[^0-9]', '') | int }}"
+
+    - name: Abort if insufficient disk space
+      ansible.builtin.fail:
+        msg: >
+          Insufficient disk: {{ free_disk_gb }}GB free on {{ inventory_hostname }},
+          {{ min_free_disk_gb }}GB required.
+      when: free_disk_gb | int < min_free_disk_gb | int
+
+    - name: Confirm backup server is reachable via SSH
+      ansible.builtin.command: >
+        ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no
+        {{ pgbackrest_repo_host_user }}@{{ pgbackrest_repo_host }}
+        "pgbackrest --stanza={{ pgbackrest_stanza }} info"
+      become: true
+      become_user: "{{ pg_user }}"
+      register: stanza_check
+      changed_when: false
+      failed_when: stanza_check.rc != 0
+      ignore_errors: true
+
+    - name: Show available backups
+      ansible.builtin.debug:
+        msg: "{{ stanza_check.stdout_lines | default(['(skipped — postgres user not yet created)']) }}"
+
+  roles:
+    - install
+    - pgbackrest_restore
+
+  post_tasks:
+    - name: Confirm not in recovery
+      ansible.builtin.command: >
+        psql -U {{ pg_superuser }} -tAc "SELECT pg_is_in_recovery();"
+      become: true
+      become_user: "{{ pg_user }}"
+      register: recovery_check
+      changed_when: false
+      until: recovery_check.stdout | trim == 'f'
+      retries: 30
+      delay: 2
+
+    - name: Show recovery state
+      ansible.builtin.debug:
+        msg: >
+          pg_is_in_recovery() = {{ recovery_check.stdout | trim }}
+          {{ '— PRIMARY OK' if recovery_check.stdout | trim == 'f'
+             else '— still in recovery (PITR pause mode? run: SELECT pg_wal_replay_resume();)' }}
+
+    - name: List databases
+      ansible.builtin.command: >
+        psql -U {{ pg_superuser }} -c "\l"
+      become: true
+      become_user: "{{ pg_user }}"
+      register: db_list
+      changed_when: false
+
+    - name: Show databases
+      ansible.builtin.debug:
+        msg: "{{ db_list.stdout_lines }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           STANDALONE RESTORE COMPLETE
+           Node    : {{ inventory_hostname }} ({{ ansible_facts['default_ipv4']['address'] | default('') }})
+           Connect : psql -h {{ ansible_facts['default_ipv4']['address'] | default('') }} -U postgres
+           Log     : /var/log/pgbackrest/
+          ============================================================
+          NOTE: This is a standalone node with no Patroni or HAProxy.
+          Connect directly to {{ ansible_facts['default_ipv4']['address'] | default('') }}:{{ pg_port | default('') }}.

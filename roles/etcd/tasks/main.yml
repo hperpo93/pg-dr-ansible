@@ -1,0 +1,203 @@
+---
+# =============================================================================
+# Role: etcd
+# Installs etcd binary, creates etcd user, writes etcd.env per node,
+# installs systemd service, starts and validates the cluster.
+# Uses TLS for both client and peer communication (matches build doc).
+# =============================================================================
+
+# --- etcd user ---------------------------------------------------------------
+
+- name: Create etcd system user
+  ansible.builtin.user:
+    name: "{{ etcd_user }}"
+    system: true
+    home: "{{ etcd_data_dir }}"
+    shell: /bin/false
+    state: present
+
+# --- Install etcd binary ------------------------------------------------------
+
+- name: Create etcd source directory
+  ansible.builtin.file:
+    path: "{{ etcd_install_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Check if etcd binary already installed
+  ansible.builtin.stat:
+    path: "{{ etcd_bin_dir }}/etcd"
+  register: etcd_bin
+
+- name: Download etcd {{ etcd_version }}
+  ansible.builtin.get_url:
+    url: "{{ etcd_download_url }}/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    dest: "{{ etcd_install_dir }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    mode: "0644"
+  when: not etcd_bin.stat.exists
+
+- name: Extract etcd archive
+  ansible.builtin.unarchive:
+    src: "{{ etcd_install_dir }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+    dest: "{{ etcd_install_dir }}"
+    remote_src: true
+  when: not etcd_bin.stat.exists
+
+- name: Install etcd and etcdctl binaries
+  ansible.builtin.copy:
+    src: "{{ etcd_install_dir }}/etcd-v{{ etcd_version }}-linux-amd64/{{ item }}"
+    dest: "{{ etcd_bin_dir }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - etcd
+    - etcdctl
+  when: not etcd_bin.stat.exists
+
+- name: Verify etcd version
+  ansible.builtin.command: etcd --version
+  register: etcd_ver
+  changed_when: false
+
+- name: Show etcd version
+  ansible.builtin.debug:
+    msg: "{{ etcd_ver.stdout_lines[0] }}"
+
+# --- Directories --------------------------------------------------------------
+
+- name: Create etcd data and config directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ etcd_data_dir }}", owner: "{{ etcd_user }}", group: "{{ etcd_group }}", mode: "0700" }
+    - { path: "{{ etcd_conf_dir }}",  owner: "{{ etcd_user }}", group: "{{ etcd_group }}", mode: "0750" }
+    - { path: "{{ etcd_ssl_dir }}",   owner: "{{ etcd_user }}", group: "{{ etcd_group }}", mode: "0750" }
+
+# --- Write etcd.env per node --------------------------------------------------
+
+- name: Write /etc/etcd/etcd.env for this node
+  ansible.builtin.template:
+    src: etcd.env.j2
+    dest: "{{ etcd_conf_dir }}/etcd.env"
+    owner: "{{ etcd_user }}"
+    group: "{{ etcd_group }}"
+    mode: "0640"
+  notify: Restart etcd
+
+# --- systemd service ----------------------------------------------------------
+
+- name: Install etcd systemd service unit
+  ansible.builtin.template:
+    src: etcd.service.j2
+    dest: /etc/systemd/system/etcd.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart etcd
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start etcd
+  ansible.builtin.systemd:
+    name: etcd
+    state: started
+    enabled: true
+
+- name: Wait for etcd client port to be ready
+  ansible.builtin.wait_for:
+    port: "{{ etcd_client_port }}"
+    host: 127.0.0.1
+    timeout: 30
+
+# --- Write etcdctl environment vars to shell profiles ------------------------
+
+- name: Build etcd client endpoints from inventory
+  ansible.builtin.set_fact:
+    etcd_endpoints_dynamic: >-
+      {{ groups['pg_nodes']
+         | map('extract', hostvars, 'etcd_node_ip')
+         | map('regex_replace', '^(.*)$', 'https://\1:' + etcd_client_port | string)
+         | join(',') }}
+
+- name: Write etcdctl env vars to /root/.bashrc
+  ansible.builtin.blockinfile:
+    path: /root/.bashrc
+    marker: "# {mark} ETCDCTL ENV"
+    block: |
+      export ETCDCTL_API=3
+      export ETCDCTL_ENDPOINTS="{{ etcd_endpoints_dynamic }}"
+      export ETCDCTL_CACERT={{ etcd_ssl_dir }}/ca.crt
+      export ETCDCTL_CERT={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.crt
+      export ETCDCTL_KEY={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.key
+
+- name: Write etcdctl env vars to /root/.profile
+  ansible.builtin.blockinfile:
+    path: /root/.profile
+    marker: "# {mark} ETCDCTL ENV"
+    block: |
+      export ETCDCTL_API=3
+      export ETCDCTL_ENDPOINTS="{{ etcd_endpoints_dynamic }}"
+      export ETCDCTL_CACERT={{ etcd_ssl_dir }}/ca.crt
+      export ETCDCTL_CERT={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.crt
+      export ETCDCTL_KEY={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.key
+
+# --- Validate cluster (run on first node only) --------------------------------
+
+- name: Wait for all etcd peers to be up before checking health
+  ansible.builtin.pause:
+    seconds: 5
+  run_once: true
+
+- name: Check etcd endpoint health
+  ansible.builtin.command: >
+    etcdctl
+    --endpoints={{ etcd_endpoints_dynamic }}
+    --cacert={{ etcd_ssl_dir }}/ca.crt
+    --cert={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.crt
+    --key={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.key
+    endpoint health
+  register: etcd_health
+  changed_when: false
+  run_once: true
+
+- name: Show etcd cluster health
+  ansible.builtin.debug:
+    msg: "{{ etcd_health.stdout_lines }}"
+  run_once: true
+
+- name: List etcd cluster members
+  ansible.builtin.command: >
+    etcdctl
+    --endpoints={{ etcd_endpoints_dynamic }}
+    --cacert={{ etcd_ssl_dir }}/ca.crt
+    --cert={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.crt
+    --key={{ etcd_ssl_dir }}/{{ etcd_cert_name }}.key
+    member list
+  register: etcd_members
+  changed_when: false
+  run_once: true
+
+- name: Show etcd members
+  ansible.builtin.debug:
+    msg: "{{ etcd_members.stdout_lines }}"
+  run_once: true
+
+# --- Switch cluster state to 'existing' after first boot ---------------------
+# This prevents accidental re-bootstrap if etcd is restarted later
+
+- name: Set ETCD_INITIAL_CLUSTER_STATE to existing
+  ansible.builtin.lineinfile:
+    path: "{{ etcd_conf_dir }}/etcd.env"
+    regexp: '^ETCD_INITIAL_CLUSTER_STATE='
+    line: 'ETCD_INITIAL_CLUSTER_STATE="existing"'
+  notify: Restart etcd

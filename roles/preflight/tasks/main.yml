@@ -1,0 +1,73 @@
+---
+# =============================================================================
+# Role: preflight
+# Validates OS, disk space, connectivity, and service state before proceeding.
+# =============================================================================
+
+- name: Assert OS is Ubuntu 24.04
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == "Ubuntu"
+      - ansible_distribution_version is version('24.04', '>=')
+    fail_msg: "This playbook targets Ubuntu 24.04+. Found: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+- name: Check free disk space on pg_data_dir mount
+  ansible.builtin.shell: |
+    df --output=avail -BG "{{ pg_data_dir | dirname }}" 2>/dev/null || \
+    df --output=avail -BG / | tail -1
+  register: free_disk
+  changed_when: false
+
+- name: Parse free disk GB
+  ansible.builtin.set_fact:
+    free_disk_gb: "{{ free_disk.stdout | regex_replace('[^0-9]', '') | int }}"
+
+- name: Abort if insufficient disk space
+  ansible.builtin.fail:
+    msg: >
+      Insufficient disk: {{ free_disk_gb }}GB free on {{ inventory_hostname }},
+      {{ min_free_disk_gb }}GB required.
+  when: free_disk_gb | int < min_free_disk_gb | int
+
+- name: Check backup server SSH + stanza (pg nodes only)
+  ansible.builtin.command: >
+    ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no
+    {{ pgbackrest_repo_host_user }}@{{ pgbackrest_repo_host }}
+    "pgbackrest --stanza={{ pgbackrest_stanza }} info"
+  become: true
+  become_user: "{{ pg_user }}"
+  register: stanza_check
+  changed_when: false
+  failed_when: stanza_check.rc != 0
+  when: inventory_hostname in groups['pg_nodes']
+
+- name: Show available backups
+  ansible.builtin.debug:
+    msg: "{{ stanza_check.stdout_lines }}"
+  when:
+    - inventory_hostname in groups['pg_nodes']
+    - stanza_check is defined
+
+- name: Confirm Patroni is NOT running (restore mode only)
+  ansible.builtin.shell: systemctl is-active patroni 2>/dev/null || echo "inactive"
+  register: patroni_active
+  changed_when: false
+  when:
+    - inventory_hostname in groups['pg_nodes']
+    - restore_mode is defined and restore_mode != ''
+
+- name: Abort if Patroni is running during a restore
+  ansible.builtin.fail:
+    msg: >
+      Patroni is active on {{ inventory_hostname }}.
+      Stop it before running a DR restore: systemctl stop patroni
+  when:
+    - inventory_hostname in groups['pg_nodes']
+    - restore_mode is defined and restore_mode != ''
+    - patroni_active.stdout | trim == 'active'
+
+- name: Preflight passed
+  ansible.builtin.debug:
+    msg: >
+      Preflight OK on {{ inventory_hostname }}:
+      {{ free_disk_gb }}GB free, all checks passed.

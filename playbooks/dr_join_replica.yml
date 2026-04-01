@@ -1,0 +1,76 @@
+---
+# =============================================================================
+# Playbook: dr_join_replica.yml — Join replica(s) to a running Patroni primary
+#
+# Run AFTER dr_primary.yml has completed and the primary is confirmed healthy.
+# Patroni handles the clone automatically (pg_basebackup by default).
+# Replicas are joined one at a time (serial: 1) to avoid clone storms.
+#
+# Run (all replicas):
+#   ansible-playbook -i inventory/hosts.ini playbooks/dr_join_replica.yml
+#
+# Run (single replica):
+#   ansible-playbook -i inventory/hosts.ini playbooks/dr_join_replica.yml \
+#     --limit <replica-hostname>
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# PLAY 1 — Verify primary is healthy before adding replicas
+# ---------------------------------------------------------------------------
+- name: "[1/3] Verify primary is Leader"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Check Patroni leader endpoint
+      ansible.builtin.uri:
+        url: "https://{{ ansible_default_ipv4.address }}:{{ patroni_api_port }}/leader"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: leader_check
+      failed_when: leader_check.status != 200
+
+    - name: Primary confirmed healthy
+      ansible.builtin.debug:
+        msg: >
+          Primary {{ inventory_hostname }} is the Patroni Leader.
+          Proceeding to join replicas.
+
+# ---------------------------------------------------------------------------
+# PLAY 2 — Install + certs + etcd on replica nodes
+# ---------------------------------------------------------------------------
+- name: "[2/3] Install packages, certs, and etcd on replica nodes"
+  hosts: pg_replicas
+  become: true
+  gather_facts: true
+  serial: 1
+
+  tasks:
+    - name: Banner
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           DR MODE  : JOIN REPLICA
+           Node     : {{ inventory_hostname }} ({{ ansible_facts['default_ipv4']['address'] | default('') }})
+           Cluster  : {{ patroni_scope | default('') }}
+          ============================================================
+
+  roles:
+    - install
+    - certs
+    - etcd
+
+# ---------------------------------------------------------------------------
+# PLAY 3 — Join replicas to cluster
+# ---------------------------------------------------------------------------
+- name: "[3/3] Start Patroni on replicas — clone from primary"
+  hosts: pg_replicas
+  become: true
+  gather_facts: true
+  serial: 1
+
+  roles:
+    - patroni
+    - validate

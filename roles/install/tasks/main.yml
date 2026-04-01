@@ -1,0 +1,180 @@
+---
+# =============================================================================
+# Role: install
+# Installs PostgreSQL, Patroni, pgBackRest, and supporting tools.
+# PostgreSQL service is stopped and disabled — Patroni manages it.
+# =============================================================================
+
+- name: Install prerequisite packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - gnupg2
+      - lsb-release
+      - ca-certificates
+      - python3-pip
+      - python3-psycopg2
+      - acl
+      - jq
+    state: present
+    update_cache: true
+
+# --- PostgreSQL ---------------------------------------------------------------
+
+- name: Add PostgreSQL APT signing key
+  ansible.builtin.apt_key:
+    url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    state: present
+
+- name: Add PostgreSQL APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+    state: present
+    filename: pgdg
+
+- name: Install PostgreSQL {{ pg_version }}
+  ansible.builtin.apt:
+    name:
+      - "postgresql-{{ pg_version }}"
+      - "postgresql-client-{{ pg_version }}"
+      - "postgresql-contrib-{{ pg_version }}"
+    state: present
+    update_cache: true
+
+- name: Stop and disable PostgreSQL (Patroni manages it)
+  ansible.builtin.systemd:
+    name: postgresql
+    state: stopped
+    enabled: false
+  ignore_errors: true
+
+# --- Directories --------------------------------------------------------------
+
+- name: Create PostgreSQL data and SSL directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ pg_data_dir }}",  mode: "0700" }
+    - { path: "{{ pg_ssl_dir }}",   mode: "0750" }
+
+# --- Patroni ------------------------------------------------------------------
+
+- name: Install Patroni and etcd extras via apt
+  ansible.builtin.apt:
+    name:
+      - patroni
+      - python3-etcd
+    state: present
+
+- name: Create Patroni config directory
+  ansible.builtin.file:
+    path: "{{ patroni_conf_dir }}"
+    state: directory
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0750"
+
+- name: Create Patroni log directory
+  ansible.builtin.file:
+    path: "{{ patroni_log_dir }}"
+    state: directory
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0750"
+
+# --- pgBackRest ---------------------------------------------------------------
+
+- name: Install pgBackRest
+  ansible.builtin.apt:
+    name: pgbackrest
+    state: present
+
+- name: Create pgBackRest directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0750"
+  loop:
+    - /etc/pgbackrest
+    - "{{ pgbackrest_log_dir }}"
+    - /tmp/pgbackrest
+
+- name: Write pgBackRest config
+  ansible.builtin.template:
+    src: pgbackrest.conf.j2
+    dest: "{{ pgbackrest_conf }}"
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0640"
+
+# --- postgres → psql-backups SSH key setup ------------------------------------
+# Generates a keypair for the postgres user on each node, then installs the
+# public key into authorized_keys on the backup server so pgBackRest can
+# connect without a password. Idempotent — skips keygen if key already exists.
+
+- name: Create postgres user .ssh directory
+  ansible.builtin.file:
+    path: /var/lib/postgresql/.ssh
+    state: directory
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0700"
+
+- name: Generate SSH keypair for postgres user (if not already present)
+  ansible.builtin.command: >
+    ssh-keygen -t rsa -b 4096
+    -f /var/lib/postgresql/.ssh/id_rsa
+    -N ""
+  become: true
+  become_user: "{{ pg_user }}"
+  args:
+    creates: /var/lib/postgresql/.ssh/id_rsa
+
+- name: Read postgres public key from this node
+  ansible.builtin.slurp:
+    src: /var/lib/postgresql/.ssh/id_rsa.pub
+  register: postgres_pubkey
+
+- name: Install postgres public key into authorized_keys on backup server
+  ansible.posix.authorized_key:
+    user: "{{ pgbackrest_repo_host_user }}"
+    key: "{{ postgres_pubkey.content | b64decode | trim }}"
+    state: present
+  delegate_to: "{{ pgbackrest_repo_host }}"
+
+- name: Accept backup server SSH host key (add to known_hosts)
+  ansible.builtin.known_hosts:
+    name: "{{ pgbackrest_repo_host }}"
+    key: "{{ lookup('pipe', 'ssh-keyscan -t rsa ' + pgbackrest_repo_host) }}"
+    path: /var/lib/postgresql/.ssh/known_hosts
+    state: present
+  become: true
+  become_user: "{{ pg_user }}"
+
+- name: Set known_hosts ownership
+  ansible.builtin.file:
+    path: /var/lib/postgresql/.ssh/known_hosts
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0644"
+
+- name: Verify postgres can reach backup server and stanza is valid
+  ansible.builtin.command: >
+    ssh -o BatchMode=yes -o ConnectTimeout=10
+    {{ pgbackrest_repo_host_user }}@{{ pgbackrest_repo_host }}
+    "pgbackrest --stanza={{ pgbackrest_stanza }} info"
+  become: true
+  become_user: "{{ pg_user }}"
+  register: pgbackrest_ssh_test
+  changed_when: false
+  failed_when: pgbackrest_ssh_test.rc != 0
+
+- name: Show pgBackRest stanza info
+  ansible.builtin.debug:
+    msg: "{{ pgbackrest_ssh_test.stdout_lines }}"

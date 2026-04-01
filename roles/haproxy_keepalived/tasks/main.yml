@@ -1,0 +1,82 @@
+---
+# =============================================================================
+# Role: haproxy_keepalived
+# Installs and configures HAProxy + Keepalived on load-balancer nodes.
+# HAProxy routes port 5432 → primary (read-write), 5433 → replicas (read-only).
+# Keepalived manages the VIP (keepalived_vip) across lb nodes.
+# =============================================================================
+
+# --- HAProxy -----------------------------------------------------------------
+
+- name: Install HAProxy and Keepalived
+  ansible.builtin.apt:
+    name:
+      - haproxy
+      - keepalived
+    state: present
+    update_cache: true
+
+- name: Write HAProxy configuration
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: "{{ haproxy_cfg }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart haproxy
+
+- name: Validate HAProxy configuration
+  ansible.builtin.command: haproxy -c -f {{ haproxy_cfg }}
+  register: haproxy_check
+  changed_when: false
+  failed_when: haproxy_check.rc != 0
+
+- name: Show HAProxy config validation result
+  ansible.builtin.debug:
+    msg: "{{ haproxy_check.stdout_lines }}"
+
+- name: Enable and start HAProxy
+  ansible.builtin.systemd:
+    name: haproxy
+    state: started
+    enabled: true
+    daemon_reload: true
+
+# --- Keepalived --------------------------------------------------------------
+
+- name: Install Keepalived check script
+  ansible.builtin.template:
+    src: check_haproxy.sh.j2
+    dest: "{{ keepalived_check_script }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write Keepalived configuration
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart keepalived
+
+- name: Enable and start Keepalived
+  ansible.builtin.systemd:
+    name: keepalived
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for VIP to be reachable (only from MASTER node)
+  ansible.builtin.wait_for:
+    host: "{{ keepalived_vip }}"
+    port: "{{ haproxy_rw_port }}"
+    timeout: 30
+  when: keepalived_state == 'MASTER'
+  ignore_errors: true
+
+- name: Confirm VIP is active
+  ansible.builtin.debug:
+    msg: "VIP {{ keepalived_vip }} is active on {{ inventory_hostname }}"
+  when: keepalived_state == 'MASTER'

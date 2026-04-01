@@ -1,0 +1,90 @@
+---
+# =============================================================================
+# Playbook: reindex.yml — Index bloat detection + REINDEX CONCURRENTLY
+#
+# Runs on the Patroni primary only. Detects indexes where the dead tuple
+# ratio exceeds the configured threshold and reindexes them with
+# REINDEX CONCURRENTLY (no table lock).
+#
+# Duration metrics are appended as JSON lines to reindex_metric_log for
+# trend tracking (fulfils the "save reindexing durations as a metric"
+# requirement).
+#
+# Schedule: end-of-month, plus on-demand when needed.
+# Maintenance window: run outside backup windows (backups run at 01:00).
+# Suggested cron: 0 20 28-31 * * (last day of month at 20:00)
+#
+# Run (all databases, live):
+#   ansible-playbook -i inventory/hosts.ini playbooks/reindex.yml
+#
+# Dry run — report bloat only, no reindexing:
+#   ansible-playbook -i inventory/hosts.ini playbooks/reindex.yml \
+#     -e "reindex_dry_run=true"
+#
+# Target specific databases only:
+#   ansible-playbook -i inventory/hosts.ini playbooks/reindex.yml \
+#     -e '{"reindex_target_databases": ["mydb", "otherdb"]}'
+#
+# Adjust bloat threshold:
+#   ansible-playbook -i inventory/hosts.ini playbooks/reindex.yml \
+#     -e "reindex_bloat_threshold_pct=15"
+#
+# On-demand reindex (override the guard and run immediately):
+#   ansible-playbook -i inventory/hosts.ini playbooks/reindex.yml \
+#     -e "reindex_dry_run=false"
+# =============================================================================
+
+- name: Index bloat detection + REINDEX CONCURRENTLY
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Banner
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           REINDEX JOB
+           Node       : {{ inventory_hostname }}
+           Databases  : {{ reindex_target_databases | default(['all']) | join(', ') }}
+           Threshold  : {{ reindex_bloat_threshold_pct }}% dead tuple ratio
+           Min size   : {{ reindex_min_table_size_mb }}MB
+           Dry run    : {{ reindex_dry_run }}
+           Metric log : {{ reindex_metric_log }}
+          ============================================================
+
+    - name: Confirm no full backup is currently running
+      ansible.builtin.command: >
+        pgrep -a pgbackrest
+      register: pgbackrest_running
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if pgBackRest backup is in progress
+      ansible.builtin.fail:
+        msg: >
+          A pgBackRest process is currently running on {{ inventory_hostname }}.
+          Do not reindex during a backup window. Wait for it to complete
+          or pass -e "reindex_dry_run=true" to do a dry run only.
+      when:
+        - pgbackrest_running.rc == 0
+        - not reindex_dry_run
+
+  roles:
+    - reindex
+
+  post_tasks:
+    - name: Remind about metric log location
+      ansible.builtin.debug:
+        msg: |
+          Metrics saved to: {{ reindex_metric_log }}
+
+          Review with:
+            cat {{ reindex_metric_log }} | python3 -c "
+            import sys, json
+            for line in sys.stdin:
+                r = json.loads(line)
+                print(f\"{r['timestamp']}  {r['database']}.{r['schema']}.{r['index']}  \
+          {r['index_size_mb']}MB  dead={r['dead_tuple_ratio']}%  \
+          {r['duration_seconds']}s  [{r['status']}]\")
+            "

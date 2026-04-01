@@ -1,0 +1,98 @@
+---
+# =============================================================================
+# Playbook: patroni_start.yml — Full Patroni cluster start (no pgBackRest restore)
+#
+# Installs packages, distributes certs, starts etcd, then starts Patroni on the
+# primary first (waits for Leader), then joins each replica one at a time.
+#
+# Use for: bootstrapping a Patroni cluster when data is already in place
+#           (e.g. after a manual restore or when re-joining an existing cluster).
+#
+# Run (full cluster):
+#   ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml
+#
+# Run (primary only — defer replicas):
+#   ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml \
+#     --limit pg_primary
+#
+# Run (join a single replica later):
+#   ansible-playbook -i inventory/hosts.ini playbooks/patroni_start.yml \
+#     --limit pg_primary,<replica-hostname>
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# PLAY 1 — Install packages + certs on all pg nodes in parallel
+# ---------------------------------------------------------------------------
+- name: "[1/5] Install + certs — all pg nodes"
+  hosts: pg_nodes
+  become: true
+  gather_facts: true
+
+  roles:
+    - install
+    - certs
+
+# ---------------------------------------------------------------------------
+# PLAY 2 — Start etcd on all nodes
+# ---------------------------------------------------------------------------
+- name: "[2/5] etcd — start cluster on all nodes"
+  hosts: pg_nodes
+  become: true
+  gather_facts: true
+
+  roles:
+    - etcd
+
+# ---------------------------------------------------------------------------
+# PLAY 3 — Start Patroni on primary and wait for Leader
+# ---------------------------------------------------------------------------
+- name: "[3/5] Start Patroni on primary — bootstrap cluster"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Banner
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           PATRONI START : PRIMARY
+           Node          : {{ inventory_hostname }} ({{ ansible_facts['default_ipv4']['address'] }})
+           Cluster       : {{ patroni_scope | default('') }}
+          ============================================================
+
+  roles:
+    - patroni
+
+# ---------------------------------------------------------------------------
+# PLAY 4 — Join replicas one at a time (Patroni clones from primary)
+# ---------------------------------------------------------------------------
+- name: "[4/5] Join replicas — clone from primary"
+  hosts: pg_replicas
+  become: true
+  gather_facts: true
+  serial: 1
+
+  tasks:
+    - name: Banner
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           PATRONI START : REPLICA
+           Node          : {{ inventory_hostname }} ({{ ansible_facts['default_ipv4']['address'] }})
+           Cluster       : {{ patroni_scope | default('') }}
+          ============================================================
+
+  roles:
+    - patroni
+
+# ---------------------------------------------------------------------------
+# PLAY 5 — Validate cluster topology
+# ---------------------------------------------------------------------------
+- name: "[5/5] Validate cluster"
+  hosts: pg_primary
+  become: true
+  gather_facts: true
+
+  roles:
+    - validate

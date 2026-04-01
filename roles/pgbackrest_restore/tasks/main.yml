@@ -1,0 +1,236 @@
+---
+# =============================================================================
+# Role: pgbackrest_restore
+# Stops PostgreSQL and Patroni, wipes PGDATA, runs pgBackRest restore.
+# Handles all four restore types: default, time, name, lsn.
+# Optional: set pgbackrest_restore_set to target a specific backup label (--set).
+# =============================================================================
+
+- name: Stop Patroni if running
+  ansible.builtin.systemd:
+    name: patroni
+    state: stopped
+  ignore_errors: true
+
+- name: Stop PostgreSQL if running
+  ansible.builtin.systemd:
+    name: postgresql
+    state: stopped
+  ignore_errors: true
+
+- name: Stop default apt-managed cluster (standalone mode — clears port 5432)
+  ansible.builtin.command: >
+    pg_ctlcluster {{ pg_version }} main stop
+  ignore_errors: true
+  when: restore_mode is defined and restore_mode == 'standalone'
+
+- name: Record restore start timestamp
+  ansible.builtin.set_fact:
+    restore_start_epoch: "{{ ansible_date_time.epoch }}"
+
+- name: Touch restore start marker (used by validate role log scan)
+  ansible.builtin.file:
+    path: /tmp/.dr_restore_start
+    state: touch
+    mode: "0644"
+
+- name: Wipe existing PGDATA
+  ansible.builtin.file:
+    path: "{{ pg_data_dir }}"
+    state: absent
+
+- name: Re-create PGDATA directory
+  ansible.builtin.file:
+    path: "{{ pg_data_dir }}"
+    state: directory
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0700"
+
+# --- Restore: default (latest backup, or specific --set) ---------------------
+
+- name: Run pgBackRest restore — latest backup
+  ansible.builtin.command: >
+    pgbackrest --stanza={{ pgbackrest_stanza }}
+    --delta
+    {% if pgbackrest_restore_set is defined and pgbackrest_restore_set != '' %}--set={{ pgbackrest_restore_set }}{% endif %}
+    restore
+  become: true
+  become_user: "{{ pg_user }}"
+  register: restore_out
+  when: pgbackrest_restore_type == 'default'
+
+# --- Restore: PITR (time) ----------------------------------------------------
+
+- name: Run pgBackRest restore — PITR (time)
+  ansible.builtin.command: >
+    pgbackrest --stanza={{ pgbackrest_stanza }}
+    --delta
+    --type=time
+    --target="{{ pgbackrest_restore_target }}"
+    --target-action={{ pgbackrest_restore_target_action }}
+    restore
+  become: true
+  become_user: "{{ pg_user }}"
+  register: restore_out
+  when:
+    - pgbackrest_restore_type == 'time'
+    - pgbackrest_restore_target != ''
+
+# --- Restore: named backup set -----------------------------------------------
+
+- name: Run pgBackRest restore — named backup
+  ansible.builtin.command: >
+    pgbackrest --stanza={{ pgbackrest_stanza }}
+    --delta
+    --type=name
+    --target={{ pgbackrest_restore_target }}
+    restore
+  become: true
+  become_user: "{{ pg_user }}"
+  register: restore_out
+  when:
+    - pgbackrest_restore_type == 'name'
+    - pgbackrest_restore_target != ''
+
+# --- Restore: LSN ------------------------------------------------------------
+
+- name: Run pgBackRest restore — LSN
+  ansible.builtin.command: >
+    pgbackrest --stanza={{ pgbackrest_stanza }}
+    --delta
+    --type=lsn
+    --target={{ pgbackrest_restore_target }}
+    restore
+  become: true
+  become_user: "{{ pg_user }}"
+  register: restore_out
+  when:
+    - pgbackrest_restore_type == 'lsn'
+    - pgbackrest_restore_target != ''
+
+- name: Show restore output
+  ansible.builtin.debug:
+    msg: "{{ restore_out.stdout_lines | default(['(no output)']) }}"
+
+- name: Record restore end timestamp
+  ansible.builtin.set_fact:
+    restore_end_epoch: "{{ ansible_date_time.epoch }}"
+
+- name: Report restore duration
+  ansible.builtin.debug:
+    msg: >
+      Restore complete on {{ inventory_hostname }}.
+      Duration: {{ ((restore_end_epoch | int) - (restore_start_epoch | int)) // 60 }}m
+      {{ ((restore_end_epoch | int) - (restore_start_epoch | int)) % 60 }}s
+
+# --- Primary and standalone: signal PostgreSQL to promote after recovery ------
+# For standalone: use recovery.signal + recovery_target=immediate so PostgreSQL
+#   applies only the WAL needed to reach the backup's consistency point, then promotes.
+# For primary/full: Patroni bootstraps the cluster (requires no standby.signal).
+# Replicas never hit this path — Patroni wipes and clones their PGDATA.
+
+- name: "Remove standby.signal — allow primary promotion"
+  ansible.builtin.file:
+    path: "{{ pg_data_dir }}/standby.signal"
+    state: absent
+  when:
+    - restore_mode is defined
+    - restore_mode in ['standalone', 'primary', 'full']
+
+- name: "[standalone] Create recovery.signal + set immediate target — promote at consistency point"
+  ansible.builtin.lineinfile:
+    path: "{{ pg_data_dir }}/postgresql.auto.conf"
+    line: "{{ item }}"
+    regexp: "^{{ item.split('=')[0] | trim }}"
+    create: true
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+  loop:
+    - "recovery_target = 'immediate'"
+    - "recovery_target_action = 'promote'"
+  when:
+    - restore_mode is defined
+    - restore_mode == 'standalone'
+
+- name: "[standalone] Write recovery.signal"
+  ansible.builtin.file:
+    path: "{{ pg_data_dir }}/recovery.signal"
+    state: touch
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+  when:
+    - restore_mode is defined
+    - restore_mode == 'standalone'
+
+# Patroni connects to PostgreSQL via TCP (127.0.0.1) on first start to manage the
+# cluster. The restored production pg_hba.conf may require md5 auth with a password
+# that differs from what Patroni has configured. Prepend local + loopback trust so
+# Patroni can connect. Patroni will overwrite pg_hba.conf with its DCS config later.
+- name: "[primary/full] Prepend local trust to pg_hba.conf for Patroni bootstrap"
+  ansible.builtin.blockinfile:
+    path: "{{ pg_data_dir }}/pg_hba.conf"
+    insertbefore: BOF
+    marker: "# {mark} PATRONI DR BOOTSTRAP TRUST"
+    block: |
+      local   all             all                                     trust
+      host    all             all             127.0.0.1/32            trust
+      host    all             all             ::1/128                 trust
+  when:
+    - restore_mode is defined
+    - restore_mode in ['primary', 'full']
+
+- name: "[standalone] Remove primary_conninfo from postgresql.auto.conf"
+  ansible.builtin.lineinfile:
+    path: "{{ pg_data_dir }}/postgresql.auto.conf"
+    regexp: "^primary_conninfo"
+    state: absent
+  when:
+    - restore_mode is defined
+    - restore_mode == 'standalone'
+    - (pg_data_dir ~ '/postgresql.auto.conf') is file
+
+- name: "[standalone] Disable SSL — certs not present on standalone node"
+  ansible.builtin.lineinfile:
+    path: "{{ pg_data_dir }}/postgresql.auto.conf"
+    line: "ssl = off"
+    regexp: "^ssl"
+    create: true
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    mode: "0600"
+  when:
+    - restore_mode is defined
+    - restore_mode == 'standalone'
+
+- name: "[standalone] Fix PGDATA ownership before start"
+  ansible.builtin.file:
+    path: "{{ pg_data_dir }}"
+    state: directory
+    owner: "{{ pg_user }}"
+    group: "{{ pg_group }}"
+    recurse: true
+
+- name: "[standalone] Start PostgreSQL directly (no Patroni)"
+  ansible.builtin.command: >
+    /usr/lib/postgresql/{{ pg_version }}/bin/pg_ctl
+    -D {{ pg_data_dir }}
+    -l /var/log/postgresql/postgresql-standalone.log
+    start
+  become: true
+  become_user: "{{ pg_user }}"
+  register: pg_start_result
+  failed_when: >
+    pg_start_result.rc != 0 and
+    'already running' not in pg_start_result.stdout
+  changed_when: pg_start_result.rc == 0
+  when: restore_mode is defined and restore_mode == 'standalone'
+
+- name: "[standalone] Wait for PostgreSQL to accept connections"
+  ansible.builtin.wait_for:
+    port: "{{ pg_port }}"
+    host: 127.0.0.1
+    timeout: 60
+  when: restore_mode is defined and restore_mode == 'standalone'

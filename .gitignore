@@ -1,0 +1,26 @@
+# ============================================================
+# Certificates — generated at runtime by the certs role
+# and pushed directly to nodes. Never commit private keys.
+# ============================================================
+/certs/
+
+# Ansible runtime artifacts
+*.retry
+.cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Ansible Vault (if used to encrypt secrets in group_vars)
+# group_vars/all.vault.yml
+# vault-password.txt
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
